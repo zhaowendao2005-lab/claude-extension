@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "zhaowendao-claude-extension",
+  "description": "zhaowendao's Claude Extension Marketplaces",
+  "owner": {
+    "name": "zhaowendao",
+    "email": "2434377358@qq.com"
+  },
+  "plugins": [
+    {
+      "name": "orcheatractor-zhaowendao",
+      "source": "./plugins/orcheatractor-zhaowendao",
+      "description": "编排与时间预算 + 模型搜索：model-agent 子代理编排、阶段计划、并行任务、中文提问、到期收尾与质量底线；附带 /model-search 模糊切换模型。",
+      "author": {
+        "name": "qihoo"
+      },
+      "category": "workflow"
+    }
+  ]
+}

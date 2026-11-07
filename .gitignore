@@ -1,0 +1,24 @@
+# Engine-generated TypeScript shims (regenerated when a plugin loads)
+**/.claude-plugin/types/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node / build tooling
+node_modules/
+*.tsbuildinfo
+
+# Plugin runtime state
+.budget/
+**/.budget/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Local Claude settings
+.claude/settings.local.json
