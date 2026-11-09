@@ -15,6 +15,19 @@ export type BudgetWorkerEntry = {
   files: number
   isWrappedUp: boolean
   isDone: boolean
+  allowedFiles?: string[]
+  spawnedAgents?: number
+  model?: string
+  modelRoute?: string
+  resolvedModel?: string
+  actualModel?: string
+  lastAnswer?: string
+  card?: string
+  description?: string
+  source?: 'dispatch' | 'legacy'
+  startedAt?: number
+  finishedAt?: number
+  modelMismatch?: boolean
 }
 
 export type BudgetPhaseLog = { name: string; atMs: number; wall: number }

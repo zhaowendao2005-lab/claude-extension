@@ -36,9 +36,14 @@ export type ProtocolInput = {
 }
 
 export function protocol(p: ProtocolInput): string {
-  const workers = p.workers.length
-    ? p.workers.map(w => `- ${w.type}  →  ${w.label}`).join('\n')
+  const modelLines = p.models.length
+    ? p.models.map(m => p.dispatchMode === 'native'
+        ? `- ${m.route}  →  ${m.label}`
+        : `- ${workerSkillName(m.route)}  →  ${m.label}`).join('\n')
     : '- （没有读到 /model 名录，只能用内置的 general-purpose）'
+  const dispatchHow = p.dispatchMode === 'native'
+    ? `派发必须用 ${TOOL} action=dispatch，一次调用传 workers 数组（每个元素 { label, model, card, description?, files? }）。插件会为每个 worker 启动一个原生 general-purpose 后台子代理，TUI 里各有独立行；不要再用 Skill 工具调用 m-*，也不要自己用 Agent 工具。默认并发上限 ${p.maxConcurrent}，超过会整批拒绝。`
+    : `${modelAgentInstructions()}（当前 harness 不支持 $.agent.spawn，只能走旧的 m-* skill 通道。）`
   return `【编排与时间预算模式已开启】run=${p.runId} · 预算 ${fmt(p.budgetMs)} · 提示点 ${cadenceText(p.cadence)}${p.extraMarks.length ? ` + ${p.extraMarks.join('、')}` : ''}
 计时只算 agent 工作时间（等用户回答 AskUserQuestion、会话空闲时停表）。插件会在提示点自动推送剩余时间和 worker 账本摘要：你不用自己查时间，也不要轮询 worker。
 阶段切换都用 ${TOOL} 记录（没加载就先用 ToolSearch 加载）。所有向用户的提问只能用 AskUserQuestion，不要停下来用文字问。
@@ -48,10 +53,10 @@ export function protocol(p: ProtocolInput): string {
    ① 探索方向 / 可以排除的范围 ② worker 用什么模型（从下面的列表里给 2~3 个方案） ③ 验收方式：自动 / 手动回归包 / 混合 ④ 用户是否在场（不在场就不能出手动回归包）
    如果按计划算阶段 2 已经超预算，这次提问里就直接给出「延时 / 砍范围」的选项。
 1. 探索：action=phase phase=explore。产出接口契约（类型、函数签名、文件归属）和任务卡，写到 ${p.deliverDir}/cards/。阶段结束时再估一次；超预算就立刻用 AskUserQuestion 申请延时或砍范围，不要等到 80% 才说。
-2. 落地：action=phase phase=implement。按文件划分任务（不按功能，避免两个 worker 改同一个文件）。${modelAgentInstructions()}
-   任务卡（就是 Skill 工具的参数）要写全：目标一句话；允许改动的文件；必读文件+行号范围；要遵守的约定（你摘录后贴进去，不让 worker 自己翻）；接口契约原文；禁止事项；自检命令；截止时间（绝对时刻 HH:MM:SS）；汇报节点；交付格式（≤10 行）。
-   派发后立刻调 action=probe 确认 worker 已出现在 agent 列表里，再调 action=card worker=<agentId> files="a.ts,b.ts" 登记这张卡的「允许改动」——登记之后，worker 改卡外文件会被插件硬拦。
-   Skill 返回后台子代理的 agent ID 后不要等待或轮询：看插件推送的账本。要纠偏或补需求用 action=say worker=<id> message="…"（等价于 SendMessage）；要看某个 worker 最近在干什么用 action=view worker=<id>；确定它跑偏了用 action=stop worker=<id>（硬停，失败会自动退化为发收尾消息）；全部收尾用 action=stop worker=all。worker 的问题会通过 SendMessage 发给你，合并后再统一问用户。你自己不要逐行读 worker 的改动，先跑静态检查，没过的地方再看。
+2. 落地：action=phase phase=implement。按文件划分任务（不按功能，避免两个 worker 改同一个文件）。${dispatchHow}
+   任务卡（dispatch 的 card 参数）要写全：目标一句话；允许改动的文件；必读文件+行号范围；要遵守的约定（你摘录后贴进去，不让 worker 自己翻）；接口契约原文；禁止事项；自检命令；截止时间（绝对时刻 HH:MM:SS）；汇报节点；交付格式（≤10 行）。
+   dispatch 返回每个 worker 的 agentId 和实际模型；需要核对时再调 action=probe。要预登记允许改动的文件，在 workers 里带 files；也可以事后调 action=card worker=<agentId> files="a.ts,b.ts"。登记之后，worker 改卡外文件会被插件硬拦。
+   拿到 dispatch 返回的 agentId 后不要等待或轮询：看插件推送的账本。要纠偏或补需求用 action=say worker=<id> message="…"（等价于 SendMessage）；要看某个 worker 最近在干什么用 action=view worker=<id>；确定它跑偏了用 action=stop worker=<id>（硬停，失败会自动退化为发收尾消息）；全部收尾用 action=stop worker=all。worker 的问题会通过 SendMessage 发给你，合并后再统一问用户。你自己不要逐行读 worker 的改动，先跑静态检查，没过的地方再看。
 3. 验收：action=phase phase=verify。底线：最后一次代码改动之后必须跑通编译 / 类型检查 / lint（插件会在你结束前检查，没跑会拦住你；项目确实没有任何静态检查时，调 action=gate 写明理由）。其余按改动类型选：
    视觉类（布局、样式、建模）→ 手动回归包；跨业务域、前后端联调 → 端到端手操步骤包 + 看日志；纯逻辑、数据转换 → 自动单测或用真实数据跑一遍；已有 e2e → 直接跑。不要过度测试。
    手动回归包写到 ${p.deliverDir}/regression.md：每一步的操作、预期结果、日志里 grep 什么关键字、出问题时截哪里发回来，目标是用户 2 分钟内能给出反馈。
@@ -59,21 +64,21 @@ export function protocol(p: ProtocolInput): string {
 到期（100%）：插件已经通知所有运行中的 worker 收尾（做完手上这一小块就停、跑自检、交接）。你必须在 60 秒内调用 AskUserQuestion 发延期申请：2~3 个选项，推荐项放第一，每项写清做了能得到什么、不做有什么风险。例如 A. 延时 N 分钟完成 X　B. 现在交付 + 手动回归包　C. 砍掉 Y。用户选延时就调 action=extend minutes=N（插件会通知 worker 新的截止时间）；选交付就收尾，然后 action=close。
 文件：本次的交付物写在 ${p.deliverDir}/。只读写本次 run 的文件；.budget/runs/ 下其它 run 是只读归档，除非用户明文指定（那时先调 action=ref 登记）。
 
-可用的 model-agent skill（Skill 工具名 → 模型）：
-${workers}
+可用的模型（route → 标签）：
+${modelLines}
 
 校准数据：
 ${p.calibration}`
 }
 
-export type WorkerLine = { id: string; label: string; status: string; last: string; ago: number; lines: number; files: number; deadline?: string }
+export type WorkerLine = { id: string; label: string; status: string; last: string; ago: number; lines: number; files: number; model?: string; deadline?: string }
 
 export function ledgerText(workers: WorkerLine[]): string {
   if (!workers.length) return '（还没有派发 worker）'
   return workers
     .map(w => {
       const stuck = w.status === '运行中' && w.ago > 120_000 ? ' ⚠️ 超过 2 分钟没有动作' : ''
-      return `- ${w.label} [${w.id}] ${w.status} · 最后：${w.last}（${fmt(w.ago)} 前）· 写入 ${w.lines} 行 / ${w.files} 个文件${w.deadline ? ` · 截止 ${w.deadline}` : ''}${stuck}`
+      return `- ${w.label} [${w.id}] ${w.status}${w.model ? ` · 模型 ${w.model}` : ''} · 最后：${w.last}（${fmt(w.ago)} 前）· 写入 ${w.lines} 行 / ${w.files} 个文件${w.deadline ? ` · 截止 ${w.deadline}` : ''}${stuck}`
     })
     .join('\n')
 }

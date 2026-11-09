@@ -1,8 +1,8 @@
 {
   "name": "orcheatractor-zhaowendao",
   "displayName": "编排、时间预算与模型搜索",
-  "version": "0.2.0",
-  "description": "统一编排 model-agent 子代理与可选时间预算：阶段计划、并行任务、中文提问、到期收尾和质量底线；并内置 /model-search 模糊搜索切换模型。默认关闭。",
+  "version": "0.3.0",
+  "description": "统一编排原生 Agent 子代理与可选时间预算：一次 dispatch 并行启动多个 general-purpose worker、每个可指定模型，阶段计划、到期收尾和质量底线；并内置 /model-search 模糊搜索切换模型。默认关闭。",
   "author": {
     "name": "qihoo"
   },
@@ -30,6 +30,14 @@
       "default": 10,
       "min": 1,
       "max": 50
+    },
+    "max_concurrent_workers": {
+      "type": "number",
+      "title": "同时运行的 worker 上限",
+      "description": "0 表示跟随 CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS（默认 20）；插件会与 env 取小",
+      "default": 0,
+      "min": 0,
+      "max": 64
     }
   }
 }

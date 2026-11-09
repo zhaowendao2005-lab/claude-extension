@@ -10,7 +10,8 @@ import { detectTimeRequirement, parseBudgetArgs, type BudgetCommand } from './li
 import { commandKey, recordCommand, summarize, type CalibRecord, type CmdStats, type PhaseName } from './lib/calib'
 import { parseCatalog, workerSkillName, type CatalogEntry } from './lib/models'
 import * as T from './lib/prompts'
-import { agentMessages, listAgents, sendTo, stopAgent, type Caps } from './lib/runtime'
+import { buildWorkerPrompt, formatDispatchResult, parseDispatch, shortModel, workerName, type DispatchRow, type DispatchWorker } from './lib/dispatch'
+import { agentMessages, listAgents, sendTo, spawnAgent, stopAgent, supportsSpawn, type Caps } from './lib/runtime'
 import { registerModelSearchCommand } from './model-search'
 
 type Cadence = { kind: 'fraction'; step: number } | { kind: 'interval'; ms: number }
@@ -30,6 +31,26 @@ type WorkerEntry = {
   allowedFiles?: string[]
   /** 该 worker 自己再派生的子代理数量 */
   spawnedAgents?: number
+  /** 请求的模型（catalog label 或 alias），用于校准与显示 */
+  model?: string
+  /** 请求的完整 route（仅 route 模式） */
+  modelRoute?: string
+  /** $.agent.spawn 返回的 resolved model */
+  resolvedModel?: string
+  /** turn.complete.usage.model，API 实际使用的模型 */
+  actualModel?: string
+  /** 最近一次 turn.complete 的最终文本 */
+  lastAnswer?: string
+  /** 任务卡路径 */
+  card?: string
+  /** TUI 行上的短描述 */
+  description?: string
+  /** 派发通道：dispatch = 原生 agent.spawn；legacy = m-* skill */
+  source?: 'dispatch' | 'legacy'
+  startedAt?: number
+  finishedAt?: number
+  /** resolvedModel 与请求 route 不一致 */
+  modelMismatch?: boolean
 }
 
 type PhaseLog = { name: PhaseName; atMs: number; wall: number }
@@ -88,7 +109,11 @@ const bound = {
   autoDetect: true,
   isInteractive: true,
   catalog: [] as CatalogEntry[],
-  caps: { list: true, stop: true } as Caps,
+  caps: { list: true, stop: true, spawn: false } as Caps,
+  /** route 模式下模型如何传给 spawn：param / hook / registered */
+  modelDelivery: 'hook' as 'param' | 'hook' | 'registered',
+  /** 同时运行的 worker 上限（插件配置与 env 取小） */
+  maxWorkers: 20,
 }
 
 /** 计时器想要的共享状态 */
@@ -98,6 +123,18 @@ const hub = {
   lastOverduePingAt: 0,
   runId: '',
 }
+
+/** dispatch 在 spawn 前登记，供 agent.spawn hook 改写 model、供 SubagentStart 认领。 */
+type PendingDispatch = {
+  label: string
+  route?: string
+  modelLabel: string
+  files: string[]
+  card: string
+  description: string
+}
+const pendingDispatches = new Map<string, PendingDispatch>()
+const registeredAgents = new Map<string, string>()
 
 // ------------------------------------------------------------------ 纯函数
 
@@ -136,6 +173,7 @@ function ledgerLines(run: RunState, now: number) {
       ago: Math.max(0, now - w.lastToolAt),
       lines: w.lines,
       files: w.files,
+      model: w.model ? shortModel(w.resolvedModel ?? w.model) : undefined,
       deadline: clockText(now + Math.max(0, run.budgetMs - workElapsed(run, now))),
     }))
 }
@@ -229,6 +267,108 @@ function isErrorResponse(response: unknown): boolean {
   return /"isError"\s*:\s*true|exit code [1-9]|Exit code: [1-9]/.test(text ?? '')
 }
 
+function sameModel(a: string, b: string): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/\[[0-9]+[mk]\]/g, '').replace(/^ccs-claude-[^/]+--/, '')
+  return norm(a) === norm(b)
+}
+
+function shortHash(s: string): string {
+  let h = 0
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+  return Math.abs(h).toString(36).slice(0, 6)
+}
+
+/** 最后手段：注册一个带完整 model 的 agent 类型。AgentSpec.prompt 必填，会替换系统提示。 */
+async function ensureModelAgent($: any, route: string, label: string): Promise<{ ok: true; type: string } | { ok: false; error: string }> {
+  const cached = registeredAgents.get(route)
+  if (cached) return { ok: true, type: cached }
+  try {
+    const short = label.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 20) || 'model'
+    const name = `m-${short}-${shortHash(route)}`
+    const r = await $.agent.register({
+      name,
+      description: `模型 ${label} 的 worker`,
+      prompt: 'You are a worker subagent. Follow the task exactly, use tools as needed, and report concisely.',
+      model: route,
+      background: true,
+    })
+    const type = typeof r?.agent === 'string' ? r.agent : `orcheatractor-zhaowendao:${name}`
+    registeredAgents.set(route, type)
+    return { ok: true, type }
+  } catch (e) {
+    return { ok: false, error: String((e as any)?.message ?? e).slice(0, 160) }
+  }
+}
+
+async function spawnWorker($: any, run: RunState, w: DispatchWorker, name: string, prompt: string): Promise<DispatchRow> {
+  let subtype = 'general-purpose'
+  let modelArg: string | undefined
+  const m = w.model
+  if (m.mode === 'route') {
+    if (bound.modelDelivery === 'param') modelArg = m.route
+    else if (bound.modelDelivery === 'registered') {
+      const reg = await ensureModelAgent($, m.route, m.label)
+      if (!reg.ok) return { label: w.label, error: reg.error }
+      subtype = reg.type
+    }
+  } else if (m.mode === 'alias') {
+    modelArg = m.alias
+  }
+
+  const cardPath = normalizePath(w.card, run.project)
+  const pending: PendingDispatch = {
+    label: w.label,
+    route: m.mode === 'route' ? m.route : undefined,
+    modelLabel: m.label,
+    files: w.files,
+    card: cardPath,
+    description: w.description,
+  }
+  if (m.mode === 'route' && bound.modelDelivery === 'hook') pendingDispatches.set(name, pending)
+  try {
+    const r = await spawnAgent($, {
+      prompt,
+      subagentType: subtype,
+      model: modelArg,
+      name,
+      description: w.description,
+      cwd: run.project,
+    })
+    if (!r.ok) {
+      pendingDispatches.delete(name)
+      return { label: w.label, error: r.note }
+    }
+    const expected = m.mode === 'route' ? m.route : m.mode === 'alias' ? m.alias : 'inherit'
+    const mismatch = m.mode !== 'inherit' && !sameModel(r.model, expected)
+    const entry: WorkerEntry = {
+      id: r.agentId,
+      type: subtype,
+      label: w.label,
+      startedAlive: workElapsed(run, Date.now()),
+      lastToolAt: Date.now(),
+      lastToolName: '刚派发',
+      lines: 0,
+      files: 0,
+      isWrappedUp: false,
+      isDone: false,
+      allowedFiles: w.files,
+      model: m.label,
+      modelRoute: m.mode === 'route' ? m.route : undefined,
+      resolvedModel: r.model,
+      card: cardPath,
+      description: w.description,
+      source: 'dispatch',
+      startedAt: Date.now(),
+      modelMismatch: mismatch,
+    }
+    await patchWorker($, run, entry)
+    return { label: w.label, agentId: r.agentId, model: r.model }
+  } catch (e) {
+    pendingDispatches.delete(name)
+    return { label: w.label, error: String((e as any)?.message ?? e).slice(0, 160) }
+  }
+}
+
 // ------------------------------------------------------------------ 存取
 
 async function currentRun($: any): Promise<RunState | undefined> {
@@ -239,7 +379,26 @@ async function currentRun($: any): Promise<RunState | undefined> {
 
 async function saveRun($: any, run: RunState): Promise<void> {
   hub.runId = run.runId
+  // 以 WORKERS map 为准合并，避免并发 SubagentStart 的旧快照覆盖新 worker。
+  const map = await workersOf($)
+  const byId = new Map(run.workers.map(w => [w.id, w]))
+  for (const w of Object.values(map)) {
+    const prev = byId.get(w.id)
+    byId.set(w.id, prev ? { ...prev, ...w } : w)
+  }
+  run.workers = [...byId.values()]
   await update($, RUNS as any, (all: any) => ({ ...(all ?? {}), [bound.sessionId]: run }))
+}
+
+/** 按 agentId upsert worker，同时更新 WORKERS map 和 run.workers。 */
+async function patchWorker($: any, run: RunState | undefined, entry: WorkerEntry): Promise<void> {
+  await saveWorker($, entry)
+  if (!run) return
+  const exists = run.workers.some(w => w.id === entry.id)
+  run.workers = exists
+    ? run.workers.map(w => w.id === entry.id ? { ...w, ...entry } : w)
+    : [...run.workers, entry]
+  await saveRun($, run)
 }
 
 async function workersOf($: any): Promise<WorkerMap> {
@@ -338,7 +497,18 @@ async function writeManifest($: any, run: RunState, status: string, summary: str
     phase: run.phase,
     phases: run.phases.map(p => ({ name: p.name, ms: p.atMs })),
     plan: run.plan,
-    workers: run.workers.map(w => ({ id: w.id, type: w.type, lines: w.lines, files: w.files, done: w.isDone })),
+    workers: run.workers.map(w => ({
+      id: w.id,
+      type: w.type,
+      label: w.label,
+      model: w.model,
+      model_route: w.modelRoute,
+      resolved_model: w.resolvedModel,
+      actual_model: w.actualModel,
+      lines: w.lines,
+      files: w.files,
+      done: w.isDone,
+    })),
     static_check: run.staticCheck,
     gate_waived: run.gateWaived,
     external_refs: run.externalRefs,
@@ -353,6 +523,8 @@ async function writeManifest($: any, run: RunState, status: string, summary: str
 // ------------------------------------------------------------------ run 生命周期
 
 async function startRun($: any, cmd: Extract<BudgetCommand, { action: 'start' }>, now: number) {
+  pendingDispatches.clear()
+  registeredAgents.clear()
   const task = cmd.task || '未命名任务'
   const run: RunState = {
     status: 'active',
@@ -394,7 +566,9 @@ async function startRun($: any, cmd: Extract<BudgetCommand, { action: 'start' }>
     extraMarks: run.extraMarksMs.map(ms => `第 ${fmt(ms)}`),
     preCapMs: run.preCapMs,
     deliverDir: run.deliverDir,
-    workers: bound.catalog.map(c => ({ type: workerTypeName(c), label: c.label })),
+    models: bound.catalog.map(c => ({ route: c.route, label: c.label })),
+    dispatchMode: bound.caps.spawn ? 'native' : 'skill',
+    maxConcurrent: bound.maxWorkers,
     calibration: await calibrationText($, now),
   })
   await $.ui.status(`⏱ 0:00 / ${fmt(run.budgetMs)}`)
@@ -409,6 +583,7 @@ function runIdOf(now: number, task: string): string {
 }
 
 async function closeRun($: any, run: RunState, status: string, summary: string, now: number): Promise<void> {
+  pendingDispatches.clear()
   const record: CalibRecord = {
     project: run.project,
     at: now,
@@ -420,7 +595,11 @@ async function closeRun($: any, run: RunState, status: string, summary: string, 
       ms: p.atMs,
       estimateMs: run.plan?.estimates[p.name] !== undefined ? run.plan.estimates[p.name]! * 1000 : undefined,
     })),
-    workers: run.workers.map(w => ({ model: routeOfType(w.type), lines: w.lines, activeMs: Math.max(30_000, now - run.startedAt) })),
+    workers: run.workers.map(w => ({
+      model: w.model ?? routeOfType(w.type),
+      lines: w.lines,
+      activeMs: w.startedAt && w.finishedAt ? Math.max(30_000, w.finishedAt - w.startedAt) : Math.max(30_000, now - run.startedAt),
+    })),
   }
   await update($, CALIB as any, (all: any) => {
     const records: CalibRecord[] = (all?.records as CalibRecord[]) ?? []
@@ -570,6 +749,11 @@ export const register: Register = (on, options) => {
     bound.useHistory = opt.use_history !== false
     bound.autoDetect = opt.auto_detect !== false
     bound.step = typeof opt.default_step_percent === 'number' ? (opt.default_step_percent as number) / 100 : 0.1
+    bound.caps = { ...bound.caps, spawn: supportsSpawn($) }
+    const envCap = Number(await $.env.get('CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'))
+    const configuredCap = typeof opt.max_concurrent_workers === 'number' ? (opt.max_concurrent_workers as number) : 0
+    const hardCap = Number.isFinite(envCap) && envCap > 0 ? Math.floor(envCap) : 20
+    bound.maxWorkers = configuredCap > 0 ? Math.min(configuredCap, hardCap) : hardCap
     hub.lastActivityAt = Date.now()
     try {
       const home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
@@ -603,13 +787,28 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'budget',
       description:
-        '编排与时间预算模式的状态操作。action: start（开启预算）、decline（本会话不再询问）、status（查看进度）、phase（切阶段）、plan（记录预算计划）、extend（延时）、close（结束）、gate（登记静态检查豁免）、ref（登记用户明文指定的历史 run）、help。',
+        '编排与时间预算模式的状态操作。action: start（开启预算）、decline（本会话不再询问）、status（查看进度）、phase（切阶段）、plan（记录预算计划）、dispatch（一次派发多个原生 worker）、extend（延时）、close（结束）、gate（登记静态检查豁免）、ref（登记用户明文指定的历史 run）、help。',
       isDeferred: true,
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['start', 'decline', 'status', 'phase', 'plan', 'extend', 'close', 'gate', 'ref', 'card', 'say', 'stop', 'view', 'probe', 'help'] },
+          action: { type: 'string', enum: ['start', 'decline', 'status', 'phase', 'plan', 'extend', 'close', 'gate', 'ref', 'card', 'say', 'stop', 'view', 'probe', 'dispatch', 'help'] },
           worker: { type: 'string', description: 'worker 的 agentId，或 last / all' },
+          workers: {
+            type: 'array',
+            description: 'dispatch 用：worker 列表；每项 { label, model, card, description?, files? }',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string' },
+                model: { type: 'string' },
+                card: { type: 'string' },
+                description: { type: 'string' },
+                files: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['label', 'model', 'card'],
+            },
+          },
           files: { type: 'string', description: 'card 用：允许改动的文件，逗号分隔' },
           message: { type: 'string', description: 'say 用：发给 worker 的内容' },
           limit: { type: 'string', description: 'view 用：读最近多少行' },
@@ -633,6 +832,13 @@ export const register: Register = (on, options) => {
     $.clock.every(1000, () => void tick($))
     return next(e)
   })
+
+  on('agent.spawn', async ($, e: any, next) => {
+    const name = typeof e?.name === 'string' ? e.name : ''
+    const hit = name ? pendingDispatches.get(name) : undefined
+    if (!hit?.route) return next(e)
+    return next({ ...e, model: hit.route })
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'orcheatractor-zhaowendao' }, async ($, e) => {
     const now = Date.now()
@@ -691,7 +897,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__orcheatractor-zhaowendao__budget' }, async ($, e: any) => {
     const now = Date.now()
-    const a = e as Record<string, string>
+    const a = e as Record<string, any>
     const run = await currentRun($)
     const ok = (text: string, context?: string[]) => ({
       result: [{ type: 'text', text }],
@@ -720,6 +926,45 @@ export const register: Register = (on, options) => {
           hub.lastActivityAt = now
         }
         return ok(`已切换到阶段：${CN_PHASE[phase] ?? phase}`)
+      }
+      case 'dispatch': {
+        if (!run) return err('没有进行中的预算')
+        if (!bound.caps.spawn) {
+          return err('当前 harness 不支持 $.agent.spawn；请按协议用 Skill 工具调用 m-* skill 派发')
+        }
+        const parsed = parseDispatch(a.workers, bound.catalog, bound.maxWorkers)
+        if (!parsed.ok) return err(parsed.error)
+        const running = run.workers.filter(w => !w.isDone).length
+        if (running + parsed.workers.length > bound.maxWorkers) {
+          return err(`并发超限：运行中 ${running}，本次 ${parsed.workers.length}，上限 ${bound.maxWorkers}。请分批派发或调高 CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS。`)
+        }
+        const rows: DispatchRow[] = []
+        for (const w of parsed.workers) {
+          const cardPath = normalizePath(w.card, run.project)
+          let cardText = ''
+          try {
+            cardText = await $.fs.read(cardPath)
+          } catch {
+            rows.push({ label: w.label, error: `读不到任务卡 ${cardPath}` })
+            continue
+          }
+          if (!cardText.trim()) {
+            rows.push({ label: w.label, error: `任务卡为空 ${cardPath}` })
+            continue
+          }
+          const name = workerName(run.runId, w.label)
+          const prompt = buildWorkerPrompt({
+            label: w.label,
+            cardPath,
+            runId: run.runId,
+            deadline: deadlineText(run),
+            modelLabel: w.model.label,
+          })
+          rows.push(await spawnWorker($, run, w, name, prompt))
+        }
+        await saveRun($, run)
+        return ok(`派发结果：
+${formatDispatchResult(rows)}`)
       }
       case 'plan': {
         if (!run) return err('没有进行中的预算')
@@ -790,6 +1035,13 @@ export const register: Register = (on, options) => {
         }
         if (!target) return err('找不到对应的 worker')
         const r = await sendTo($, target.id, a.message ?? '')
+        if (r.ok && target.isDone) {
+          target.isDone = false
+          target.isWrappedUp = false
+          await saveWorker($, target)
+          run.workers = run.workers.map(x => x.id === target.id ? { ...x, isDone: false, isWrappedUp: false } : x)
+          await saveRun($, run)
+        }
         return r.ok ? ok(`已发给 ${target.id.slice(0, 8)}`) : err(`发送失败：${r.note ?? ''}`)
       }
       case 'stop': {
@@ -798,6 +1050,10 @@ export const register: Register = (on, options) => {
         if (!list.length) return err('找不到对应的 worker')
         const lines: string[] = []
         for (const w of list) {
+          if (w.isDone) {
+            lines.push(`${w.label}: 已结束`)
+            continue
+          }
           const hard = await stopAgent($, w.id)
           if (!hard.ok) {
             const soft = await sendTo($, w.id, T.WRAP_UP_WORKER)
@@ -847,6 +1103,7 @@ export const register: Register = (on, options) => {
   )
 
   on('turn.start', async ($, e, next) => {
+    if ((e as any).agentId !== undefined) return next(e)
     const run = await currentRun($)
     if (run && run.pendingSince !== null) await resumeRun($, run, Date.now())
     return next(e)
@@ -855,7 +1112,8 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     const run = await currentRun($)
     // 用户正在补充需求或回答提问时停表；插件自己的唤醒消息不计作用户等待。
-    if (run && !e.isMeta && e.origin?.kind !== 'plugin' && run.pendingSince === null) {
+    const originKind = (e as any).origin?.kind
+    if (run && !e.isMeta && originKind !== 'plugin' && originKind !== 'task-notification' && run.pendingSince === null) {
       await pauseRun($, run, Date.now())
     }
     if (!bound.autoDetect || !bound.isInteractive) return next(e)
@@ -872,6 +1130,14 @@ export const register: Register = (on, options) => {
     if (!run) return next(e)
     const now = Date.now()
     hub.lastActivityAt = now
+    const map = await workersOf($)
+    if (map[e.agent_id]) {
+      // dispatch 已经写入；补一次 run 快照即可，绝不重复 append。
+      await saveRun($, run)
+      const rest = await next(e)
+      const text = T.subagentStartText({ remainMs: Math.max(0, run.budgetMs - workElapsed(run, now)), budgetMs: run.budgetMs })
+      return { ...(rest as any), additionalContext: [...((rest as any)?.additionalContext ?? []), text] }
+    }
     const entry: WorkerEntry = {
       id: e.agent_id,
       type: e.agent_type,
@@ -909,14 +1175,19 @@ export const register: Register = (on, options) => {
   on('classic.SubagentStop', async ($, e: any, next) => {
     const map = await workersOf($)
     const w = map[e.agent_id]
+    const run = await currentRun($)
     if (w) {
       w.isDone = true
       w.isWrappedUp = true
-      await saveWorker($, w)
-    }
-    const run = await currentRun($)
-    if (run) {
-      run.workers = run.workers.map(x => (x.id === e.agent_id ? { ...x, isDone: true, isWrappedUp: true } : x))
+      w.finishedAt = Date.now()
+      if (!w.lastAnswer) {
+        const rows = await agentMessages($, e.agent_id, 3)
+        const last = [...rows].reverse().find(r => r.role === 'assistant' && r.text.trim())
+        if (last) w.lastAnswer = last.text.slice(0, 4000)
+      }
+      await patchWorker($, run, w)
+    } else if (run) {
+      run.workers = run.workers.map(x => (x.id === e.agent_id ? { ...x, isDone: true, isWrappedUp: true, finishedAt: Date.now() } : x))
       await saveRun($, run)
     }
     return next(e)
@@ -948,7 +1219,7 @@ export const register: Register = (on, options) => {
     if (w) {
       w.lastToolAt = now
       w.lastToolName = String(e.tool ?? '')
-      if (RESERVED_TOOLS.has(w.lastToolName)) w.isDone = true
+      if (RESERVED_TOOLS.has(w.lastToolName) && w.source !== 'dispatch') w.isDone = true
       await saveWorker($, w)
     }
     hub.lastActivityAt = now
@@ -1009,6 +1280,17 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e: any, next) => {
     const run = await currentRun($)
+    if (run && e.agentId !== undefined) {
+      const map = await workersOf($)
+      const w = map[e.agentId]
+      if (w) {
+        w.lastAnswer = String(e.answer ?? '').slice(0, 4000)
+        const usageModel = (e as any).usage?.model
+        if (typeof usageModel === 'string') w.actualModel = usageModel
+        await patchWorker($, run, w)
+      }
+      return next(e)
+    }
     if (run && e.agentId === undefined && run.phase === 'verify' && run.workers.every(w => w.isDone)) {
       const now = Date.now()
       if (run.pendingSince === null) await pauseRun($, run, now)

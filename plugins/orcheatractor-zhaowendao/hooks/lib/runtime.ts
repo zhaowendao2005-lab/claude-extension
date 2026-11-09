@@ -8,6 +8,7 @@ export type AgentInfoLite = {
   description: string
   status: string
   parentId?: string
+  name?: string
 }
 
 export type Caps = {
@@ -15,6 +16,8 @@ export type Caps = {
   list: boolean
   /** TaskStop 认得 agentId */
   stop: boolean
+  /** $.agent.spawn() 可用，插件能直接派发原生子代理 */
+  spawn: boolean
 }
 
 /** 读一次子代理列表；失败返回 undefined（不代表空）。 */
@@ -28,6 +31,7 @@ export async function listAgents($: any): Promise<AgentInfoLite[] | undefined> {
       description: String(r?.description ?? ''),
       status: String(r?.status ?? ''),
       parentId: r?.parentId ? String(r.parentId) : undefined,
+      name: r?.name ? String(r.name) : undefined,
     }))
   } catch {
     return undefined
@@ -73,5 +77,51 @@ export async function stopAgent($: any, agentId: string): Promise<{ ok: boolean;
 /** 会话启动时做一次能力探测；探测失败按「不支持」处理，UI 不画对应按钮。 */
 export async function probeCaps($: any): Promise<Caps> {
   const rows = await listAgents($)
-  return { list: rows !== undefined, stop: true }
+  return { list: rows !== undefined, stop: true, spawn: true }
+}
+
+export type SpawnArgs = {
+  prompt: string
+  subagentType?: string
+  model?: string
+  name?: string
+  description?: string
+  cwd?: string
+}
+
+export type SpawnOutcome =
+  | { ok: true; agentId: string; model: string }
+  | { ok: false; note: string }
+
+/** 插件 API 的 agent.spawn 是静态成员；校验器禁止把它当值读取，实际不可用时由 spawnAgent 的 try/catch 兜底。 */
+export function supportsSpawn(_$: any): boolean {
+  return true
+}
+
+/**
+ * 派发一个原生 Agent 子代理。插件 spawn 天然后台，resolve 时子代理已启动；
+ * 结果里的 model 是引擎实际解析到的模型。
+ */
+export async function spawnAgent($: any, args: SpawnArgs): Promise<SpawnOutcome> {
+  try {
+    const r: any = await $.agent.spawn({
+      prompt: args.prompt,
+      ...(args.subagentType ? { subagentType: args.subagentType } : {}),
+      ...(args.model ? { model: args.model } : {}),
+      ...(args.name ? { name: args.name } : {}),
+      ...(args.description ? { description: args.description } : {}),
+      ...(args.cwd ? { cwd: args.cwd } : {}),
+    })
+    if (r && typeof r.deny === 'string') return { ok: false, note: r.deny }
+    if (!r || typeof r.agentId !== 'string' || r.agentId === '') {
+      return { ok: false, note: '$.agent.spawn 没有返回 agentId' }
+    }
+    return {
+      ok: true,
+      agentId: r.agentId,
+      model: typeof r.model === 'string' ? r.model : (args.model ?? 'inherit'),
+    }
+  } catch (e) {
+    return { ok: false, note: String((e as any)?.message ?? e).slice(0, 200) }
+  }
 }

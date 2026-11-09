@@ -31,7 +31,7 @@
 
 ## 依赖
 
-读取 `~/.claude/settings.json` 里的 `/model` 名录来注册 worker 类型；名录为空时退回内置的 general-purpose。
+派发通过插件 API `$.agent.spawn` 启动原生 `general-purpose` 子代理；模型名录来自 `~/.claude/settings.json` 的 `modelPicker.options`。旧版 harness 没有 `$.agent.spawn` 时自动回退到 model-agents 生成的 `m-*` skill 通道。
 
 ## 安装
 
@@ -39,6 +39,18 @@
 /plugin marketplace add zhaowendao2005/claude-extension
 /plugin install orcheatractor-zhaowendao@zhaowendao-claude-extension
 ```
+
+## 原生派发与并发
+
+进入落地阶段后，主 agent 用一次 `budget action=dispatch` 派发多个 worker。插件为每个 worker 调用 `$.agent.spawn({ subagentType: "general-purpose", model, name, description, prompt })`：
+
+- 走的是 Claude Code 原生 Agent 工具的同一条路径，TUI 里每个 worker 有独立行、可钻入；
+- 不再有 fork-skill 的同名单实例锁，多个 worker 真正并发；
+- 每插件并发上限默认 20，可用 `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` 调高；插件配置 `max_concurrent_workers` 可再取小；
+- `model` 支持完整 route、catalog 唯一子串、`sonnet/opus/haiku/fable` 或 `inherit`；返回的 `resolvedModel` 与 `manifest.json` 会记录实际模型；
+- 如果完整 route 无法直接作为 Agent 的 `model` 参数，插件会用 `agent.spawn` hook 改写模型（默认策略），仍保留内置 general-purpose 的系统提示。
+
+模型是否真的生效，可看子代理的 `meta.json`（`model`/`pickedEffortModel`）或 transcript 的 `api-request.params.model`。
 
 ## 模型搜索（/model-search）
 
@@ -57,6 +69,7 @@
 |---|---|
 | `start` / `extend` / `close` / `gate` | 开关预算、延时、结束、静态检查豁免 |
 | `phase` / `plan` | 记录阶段和预算计划 |
+| `dispatch workers=[...]` | 一次派发多个原生 worker：每项 `{ label, model, card, description?, files? }`，返回 `agentId` 与实际模型 |
 | `card worker=<id> files="a,b"` | 登记 worker 允许改动的文件；登记后越界改文件会被硬拦 |
 | `say worker=<id|all> message="…"` | 给 worker 发消息（btw / 纠偏） |
 | `view worker=<id> limit=10` | 读 worker 最近的对话行 |
