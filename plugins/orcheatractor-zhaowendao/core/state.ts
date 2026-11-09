@@ -1,16 +1,25 @@
 export type PauseReason = string;
 export type Phase = 'pre-explore' | 'explore' | 'implement' | 'verify';
+export type AttemptStatus = 'creating' | 'running' | 'completed' | 'failed' | 'ended';
 export type Attempt = {
   id: string; taskId: string; ownerSessionId: string; agentId?: string;
   name: string; requestedModel: string; resolvedModel?: string; actualModel?: string;
-  status: 'creating' | 'running' | 'completed' | 'failed' | 'interrupted' | 'unknown';
+  status: AttemptStatus;
   managed: boolean; createdAt: number; updatedAt: number; reason?: string;
+  cycle?: number;
+  /** 临时 worktree；为空表示共享工作区 */
+  workspace?: string;
+  /** 声明文件的回收结果：copy 成功 / 冲突 / 未回收 */
+  merge?: { status: 'done' | 'partial' | 'skipped' | 'conflict'; detail?: string };
+  endedAt?: number;
+  stopConfirmed?: boolean;
+  salvage?: { dir: string; files: string[]; complete: boolean };
 };
 export type Task = { id: string; label: string; cardPath: string; allowedFiles: string[]; attemptIds: string[] };
 export type Run = {
   schemaVersion: 1; revision: number; id: string; project: string; task: string;
   deliverDir: string; createdSessionId: string; ownerSessionId: string;
-  status: 'running' | 'paused' | 'interrupted' | 'recovering' | 'verifying' | 'completed' | 'cancelled';
+  status: 'running' | 'paused' | 'interrupted' | 'verifying' | 'completed' | 'cancelled';
   phase: Phase; budgetMs: number; workMs: number; segmentStart: number | null;
   pauses: Record<string, number>; tasks: Record<string, Task>; attempts: Record<string, Attempt>;
   check: { editRevision: number; passedRevision: number | null; waiver: string | null };
@@ -20,6 +29,9 @@ export type Run = {
   estimates: Record<string, number>;
   firedMarks: string[];
   refs: Array<{ run: string; phrase: string }>;
+  /** 第几轮"继续"；每次继续 +1，阶段重置但任务记录保留 */
+  cycle?: number;
+  previousOwners?: string[];
 };
 export type CreateRunInput = { id: string; project: string; sessionId: string; task: string; budgetMs: number; now: number; deliverDir: string };
 export type Event =
@@ -36,8 +48,17 @@ export type Event =
   | { type: 'attempt-created' | 'attempt-observed'; attempt: Attempt; now: number }
   | { type: 'attempt-reconciled'; attemptId: string; status: 'running'; now: number }
   | { type: 'attempt-started'; attemptId: string; agentId: string; resolvedModel: string; now: number }
-  | { type: 'attempt-finished'; agentId: string; outcome: 'completed' | 'failed' | 'interrupted'; reason?: string; actualModel?: string; now: number }
-  | { type: 'attempt-unknown'; attemptId: string; reason: string; now: number }
+  | { type: 'attempt-finished'; agentId: string; outcome: 'completed' | 'failed'; reason?: string; actualModel?: string; now: number }
+  /** 打断/会话结束时的收敛：非终态 → ended；终态不变 */
+  | { type: 'attempt-ended'; attemptId: string; reason: string; stopConfirmed: boolean; now: number }
+  /** 抢救产物记录 */
+  | { type: 'salvage'; attemptId: string; dir: string; files: string[]; complete: boolean; now: number }
+  /** 声明文件从 worktree 回收的结果 */
+  | { type: 'merge'; attemptId: string; status: 'done' | 'partial' | 'skipped' | 'conflict'; detail?: string; now: number }
+  /** 新一轮"继续"：cycle+1、阶段回到 pre-explore、清暂停；任务与 attempt 记录保留 */
+  | { type: 'cycle-start'; now: number }
+  /** 所有权迁移：旧会话已无存活执行时才允许 */
+  | { type: 'takeover'; sessionId: string; now: number }
   | { type: 'attempt-model'; agentId: string; actualModel: string; now: number }
   | { type: 'edit'; now: number }
   | { type: 'check'; passed: boolean; now: number; revision?: number }
@@ -51,7 +72,9 @@ const put = <T>(object: Record<string, T>, key: string, value: T) => {
   Object.defineProperty(object, key, { value, enumerable: true, configurable: true, writable: true });
 };
 const terminal = (run: Run) => run.status === 'completed' || run.status === 'cancelled';
-const settled = (attempt: Attempt) => attempt.status === 'completed' || attempt.status === 'failed';
+const settled = (attempt: Attempt) => attempt.status === 'completed' || attempt.status === 'failed' || attempt.status === 'ended';
+/** 可能还在宿主侧运行、或结果未确认的执行 */
+const live = (attempt: Attempt) => attempt.status === 'creating' || attempt.status === 'running';
 function finite(value: number, label: string) {
   if (!Number.isFinite(value)) throw new Error(`${label} must be finite`);
 }
@@ -66,8 +89,15 @@ export function createRun(input: CreateRunInput): Run {
     check: { editRevision: 0, passedRevision: null, waiver: null },
     createdAt: input.now, updatedAt: input.now, endedAt: null, closeReason: null,
     events: [{ seq: 0, at: input.now, type: 'created' }],
-    config: {}, estimates: {}, firedMarks: [], refs: [],
+    config: {}, estimates: {}, firedMarks: [], refs: [], cycle: 0, previousOwners: [],
   };
+}
+/** 任务是否已完成：存在 completed 的 attempt，且产物回收没有失败 */
+export function taskDone(run: Run, task: Task): boolean {
+  return task.attemptIds.some(id => {
+    const attempt = own(run.attempts, id) ? run.attempts[id]! : undefined;
+    return attempt !== undefined && attempt.status === 'completed' && attempt.merge?.status !== 'conflict';
+  });
 }
 export function elapsed(run: Run, now: number): number {
   finite(now, 'now');
@@ -78,7 +108,7 @@ export function completionProblems(run: Run): string[] {
     .filter(attempt => attempt.managed && !settled(attempt))
     .map(attempt => `Managed attempt ${attempt.id} is ${attempt.status}`);
   for (const task of Object.values(run.tasks)) {
-    if (!task.attemptIds.some(id => own(run.attempts, id) && run.attempts[id]!.taskId === task.id && run.attempts[id]!.status === 'completed'))
+    if (!taskDone(run, task))
       problems.push(`Task ${task.id} has no completed attempt`);
   }
   if (run.check.editRevision > 0 && run.check.passedRevision !== run.check.editRevision && !run.check.waiver)
@@ -88,7 +118,7 @@ export function completionProblems(run: Run): string[] {
 /** Attempt counts include unmanaged observations; completion gates only managed attempts. */
 export function counts(run: Run): Record<string, number> {
   const result = { tasks: Object.keys(run.tasks).length, attempts: 0, managed: 0,
-    creating: 0, running: 0, completed: 0, failed: 0, interrupted: 0, unknown: 0 };
+    creating: 0, running: 0, completed: 0, failed: 0, ended: 0 };
   for (const attempt of Object.values(run.attempts)) {
     result.attempts++; result[attempt.status]++; if (attempt.managed) result.managed++;
   }
@@ -96,10 +126,8 @@ export function counts(run: Run): Record<string, number> {
 }
 export function reduce(previous: Run, event: Event): Run {
   finite(event.now, 'now');
-  if (event.type === 'recover' && event.sessionId !== previous.ownerSessionId)
-    throw new Error('Cross-session recovery requires host-confirmed takeover');
   // A closed run cannot resume work, but existing workers may still report facts.
-  const workerAudit = ['attempt-finished', 'attempt-model', 'attempt-unknown', 'attempt-reconciled', 'attempt-started'].includes(event.type);
+  const workerAudit = ['attempt-finished', 'attempt-ended', 'attempt-model', 'attempt-reconciled', 'attempt-started', 'salvage'].includes(event.type);
   if (terminal(previous) && !workerAudit) return previous;
   const run = structuredClone(previous);
   const stop = () => { run.workMs = elapsed(run, event.now); run.segmentStart = null; };
@@ -191,11 +219,10 @@ export function reduce(previous: Run, event: Event): Run {
     }
     case 'attempt-started': {
       const attempt = attemptById(event.attemptId);
-      const bindingUnknown = attempt.status === 'unknown' && !attempt.agentId;
-      if (attempt.status !== 'creating' && attempt.status !== 'running' && !bindingUnknown) break;
+      if (attempt.status !== 'creating' && attempt.status !== 'running') break;
       if (attempt.agentId && attempt.agentId !== event.agentId) throw new Error('Attempt already bound to another agent');
       if (Object.values(run.attempts).some(a => a.id !== attempt.id && a.agentId === event.agentId)) throw new Error('Duplicate agent ID');
-      Object.assign(attempt, { status: bindingUnknown ? 'unknown' : 'running', agentId: event.agentId, resolvedModel: event.resolvedModel, updatedAt: event.now }); break;
+      Object.assign(attempt, { status: 'running', agentId: event.agentId, resolvedModel: event.resolvedModel, updatedAt: event.now }); break;
     }
     case 'attempt-finished': {
       const attempt = Object.values(run.attempts).find(a => a.agentId === event.agentId);
@@ -214,11 +241,6 @@ export function reduce(previous: Run, event: Event): Run {
       attempt.actualModel = event.actualModel;
       attempt.updatedAt = Math.max(attempt.updatedAt, event.now); break;
     }
-    case 'attempt-unknown': {
-      const attempt = attemptById(event.attemptId);
-      if (!settled(attempt)) Object.assign(attempt, { status: 'unknown', reason: event.reason, updatedAt: event.now });
-      break;
-    }
     case 'edit': run.check = { editRevision: run.revision + 1, passedRevision: null, waiver: null }; break;
     case 'check':
       if ((event.revision ?? run.check.editRevision) === run.check.editRevision)
@@ -230,14 +252,60 @@ export function reduce(previous: Run, event: Event): Run {
     case 'interrupt':
       stop(); run.status = 'interrupted';
       for (const attempt of Object.values(run.attempts)) {
-        if (attempt.managed && !settled(attempt) && attempt.status !== 'unknown') {
-          attempt.status = attempt.agentId ? 'interrupted' : 'unknown';
-          attempt.reason = event.reason; attempt.updatedAt = event.now;
+        if (attempt.managed && !settled(attempt)) {
+          attempt.status = 'ended'; attempt.reason = event.reason;
+          attempt.endedAt = event.now; attempt.updatedAt = event.now;
+          if (attempt.stopConfirmed === undefined) attempt.stopConfirmed = false;
         }
       }
       break;
+    case 'attempt-ended': {
+      const attempt = attemptById(event.attemptId);
+      if (settled(attempt)) { attempt.stopConfirmed = event.stopConfirmed; break; }
+      attempt.status = 'ended'; attempt.reason = event.reason;
+      attempt.endedAt = event.now; attempt.updatedAt = event.now;
+      attempt.stopConfirmed = event.stopConfirmed;
+      break;
+    }
+    case 'merge': {
+      const attempt = attemptById(event.attemptId);
+      attempt.merge = { status: event.status, ...(event.detail ? { detail: event.detail } : {}) };
+      attempt.updatedAt = Math.max(attempt.updatedAt, event.now);
+      break;
+    }
+    case 'salvage': {
+      const attempt = attemptById(event.attemptId);
+      attempt.salvage = { dir: event.dir, files: event.files, complete: event.complete };
+      attempt.updatedAt = Math.max(attempt.updatedAt, event.now);
+      break;
+    }
+    case 'cycle-start': {
+      if (terminal(run)) throw new Error('已关闭的任务不能继续');
+      run.cycle = (run.cycle ?? 0) + 1;
+      run.phase = 'pre-explore';
+      run.pauses = {};
+      run.firedMarks = [];
+      run.status = activeStatus();
+      run.segmentStart = Math.max(event.now, run.updatedAt);
+      run.endedAt = null;
+      break;
+    }
+    case 'takeover': {
+      const already = run.previousOwners ?? [];
+      put(run, 'previousOwners', [...already, run.ownerSessionId].slice(-20));
+      run.ownerSessionId = event.sessionId;
+      run.createdSessionId = run.id ? run.createdSessionId : event.sessionId;
+      break;
+    }
     case 'recover':
-      if (run.status === 'interrupted' || run.status === 'recovering') {
+      if (event.sessionId !== run.ownerSessionId) {
+        const liveAttempts = Object.values(run.attempts).filter(a => a.managed && live(a));
+        if (liveAttempts.length) throw new Error(`旧会话仍有 ${liveAttempts.length} 个未结束执行；先 probe 收敛后再接管`);
+        const already = run.previousOwners ?? [];
+        put(run, 'previousOwners', [...already, run.ownerSessionId].slice(-20));
+        run.ownerSessionId = event.sessionId;
+      }
+      if (run.status === 'interrupted') {
         run.status = Object.keys(run.pauses).length ? 'paused' : activeStatus(); start();
       }
       break;
@@ -266,6 +334,8 @@ export function reduce(previous: Run, event: Event): Run {
   if ('key' in event) detail.key = event.key;
   if ('outcome' in event) detail.outcome = event.outcome;
   if ('status' in event) detail.status = event.status;
+  if ('stopConfirmed' in event) detail.stopConfirmed = event.stopConfirmed;
+  if (event.type === 'cycle-start') detail.cycle = run.cycle ?? 0;
   if (event.type === 'check') {
     detail.passed = event.passed;
     detail.revision = event.revision ?? run.check.editRevision;

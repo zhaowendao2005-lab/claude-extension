@@ -113,34 +113,32 @@ test('complete and cancel are irreversible with fixed elapsed time', () => {
   }
 });
 
-test('interrupt preserves uncertainty, recovery cannot transfer session ownership', () => {
+test('interrupt ends live workers and a new session can take over the task', () => {
   let run = reduce(started(), { type: 'interrupt', reason: 'shutdown', now: 130 });
   assert.equal(run.status, 'interrupted');
-  assert.equal(run.attempts.a.status, 'interrupted');
+  assert.equal(run.attempts.a.status, 'ended');
+  assert.equal(run.attempts.a.stopConfirmed, false);
   assert.equal(elapsed(run, 1000), 30);
-  assert.throws(() => reduce(run, { type: 'recover', sessionId: 'intruder', now: 140 }), /Cross-session/);
-  run = reduce(run, { type: 'recover', sessionId: 'owner', now: 150 });
+  run = reduce(run, { type: 'recover', sessionId: 'intruder', now: 140 });
+  assert.equal(run.ownerSessionId, 'intruder');
+  assert.deepEqual(run.previousOwners, ['owner']);
+  run = reduce(run, { type: 'cycle-start', now: 150 });
+  assert.equal(run.cycle, 1);
+  assert.equal(run.phase, 'pre-explore');
   assert.equal(run.status, 'running');
-  assert.equal(run.attempts.a.status, 'interrupted');
   assert.equal(elapsed(run, 160), 40);
-  assert.equal(completionProblems(run).length, 2);
-  run = reduce(run, { type: 'attempt-finished', agentId: 'agent', outcome: 'completed', now: 170 });
-  assert.deepEqual(completionProblems(run), []);
-  let unknown = reduce(withAttempt(), { type: 'interrupt', reason: 'lost', now: 130 });
-  assert.equal(unknown.attempts.a.status, 'unknown');
-  unknown = reduce(unknown, { type: 'recover', sessionId: 'owner', now: 150 });
-  assert.equal(unknown.attempts.a.status, 'unknown');
-  assert.deepEqual(unknown.tasks.t.attemptIds, ['a']);
+  assert.equal(completionProblems(run).length, 1);
 });
 
-test('explicit unknown and pauses survive recovery', () => {
-  let run = reduce(started(), { type: 'attempt-unknown', attemptId: 'a', reason: 'lost contact', now: 115 });
-  run = reduce(run, { type: 'pause', reason: 'user', now: 120 });
-  run = reduce(run, { type: 'interrupt', reason: 'exit', now: 130 });
-  run = reduce(run, { type: 'recover', sessionId: 'owner', now: 140 });
-  assert.equal(run.status, 'paused');
-  assert.equal(run.attempts.a.status, 'unknown');
-  assert.equal(elapsed(run, 1000), 20);
+test('ended attempts stay ended across recovery and still require a completed attempt', () => {
+  let run = reduce(withAttempt(), { type: 'interrupt', reason: 'lost', now: 130 });
+  assert.equal(run.attempts.a.status, 'ended');
+  run = reduce(run, { type: 'recover', sessionId: 'owner', now: 150 });
+  assert.equal(run.attempts.a.status, 'ended');
+  assert.deepEqual(run.tasks.t.attemptIds, ['a']);
+  assert.equal(completionProblems(run).length, 1);
+  run = reduce(run, { type: 'attempt-ended', attemptId: 'a', reason: 'late stop', stopConfirmed: true, now: 155 });
+  assert.equal(run.attempts.a.stopConfirmed, true);
 });
 
 test('pure reducer, phase, budget, counts, safe arbitrary map keys and bounded audit log', () => {
@@ -215,12 +213,10 @@ test('task completion requires a successful attempt, including after failures', 
   assert.equal(reduce(run, { type: 'complete', now: 140, reason: 'done' }).status, 'completed');
 });
 
-test('unknown intent can bind then reconcile without reviving settled attempts', () => {
-  let run = withAttempt({ status: 'unknown' });
+test('a creating intent binds to a late agent and reconcile only confirms running', () => {
+  let run = withAttempt({ status: 'creating' });
   run = reduce(run, { type: 'attempt-started', attemptId: 'a', agentId: 'found', resolvedModel: 'resolved', now: 120 });
   assert.equal(run.attempts.a.agentId, 'found');
-  assert.equal(run.attempts.a.status, 'unknown');
-  run = reduce(run, { type: 'attempt-reconciled', attemptId: 'a', status: 'running', now: 130 });
   assert.equal(run.attempts.a.status, 'running');
   run = reduce(run, { type: 'attempt-finished', agentId: 'found', outcome: 'failed', now: 140 });
   run = reduce(run, { type: 'attempt-reconciled', attemptId: 'a', status: 'running', now: 150 });
@@ -333,7 +329,6 @@ test('cancelled runs retain live workers and accept cleanup facts without revivi
   const closed = { status: run.status, workMs: run.workMs, segmentStart: run.segmentStart, endedAt: run.endedAt, closeReason: run.closeReason };
   assert.equal(run.attempts.a.status, 'running');
   for (const event of [
-    { type: 'attempt-unknown', attemptId: 'a', reason: 'not visible', now: 130 },
     { type: 'attempt-reconciled', attemptId: 'a', status: 'running', now: 140 },
     { type: 'attempt-model', agentId: 'agent', actualModel: 'observed-model', now: 150 },
     { type: 'attempt-finished', agentId: 'agent', outcome: 'completed', actualModel: 'final-model', now: 160 },

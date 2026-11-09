@@ -1,7 +1,7 @@
 // Host bridge only. All authoritative transitions go through the durable controller.
 import type { Register } from 'claude-code'
 import { RunController } from '../core/controller'
-import { completionProblems, counts, elapsed, type Run, type Attempt } from '../core/state'
+import { completionProblems, counts, elapsed, taskDone, type Run, type Attempt } from '../core/state'
 import { createRunStore } from '../storage/run-store'
 import { parseBudgetArgs, parseDuration, extractCadence, detectTimeRequirement } from './lib/parse'
 import { fmt, makeRunId } from './lib/schedule'
@@ -50,6 +50,25 @@ function status(run: Run): string {
   ].join('\n')
 }
 
+/** 继续时的基线说明：已完成的不重做，未完成的重新派发。 */
+function brief(run: Run): string {
+  const done: string[] = [], todo: string[] = []
+  for (const task of Object.values(run.tasks)) {
+    if (taskDone(run, task)) {
+      done.push(`✓ ${task.label} — ${task.allowedFiles.join(', ')}`)
+    } else {
+      const last = task.attemptIds.map(id => run.attempts[id]).filter(Boolean).pop()
+      todo.push(`· ${task.label} — ${last ? `${last.status}${last.reason ? `（${last.reason}）` : ''}` : '未派发'}`)
+    }
+  }
+  const salvaged = Object.values(run.attempts).filter(a => a.salvage)
+  return [
+    done.length ? `已完成任务（继续时跳过，不重做）：\n${done.join('\n')}` : '已完成任务：无',
+    todo.length ? `待办任务（继续时重新派发）：\n${todo.join('\n')}` : '待办任务：无',
+    salvaged.length ? `打断时抢救的产物：${salvaged.map(a => `${a.id} → ${a.salvage!.dir}`).join('；')}` : '',
+  ].filter(Boolean).join('\n')
+}
+
 // The host instantiates this module per session. State here is only a binding/cache;
 // durable run state lives exclusively in RunStore, never in these variables.
 let opt: Record<string, unknown> = {}
@@ -71,6 +90,31 @@ let opt: Record<string, unknown> = {}
   const toolChecks = new Map<string, number>()
   const asks = new Set<string>()
   const now = () => Date.now()
+  /** 当前选中任务目录（绝对路径）；run 按目录寻址 */
+  let selectedDir = ''
+  const taskDirOf = (r: Run) => r.deliverDir
+  const openTask = async ($: any, dir: string) => {
+    store = await createRunStore($, dir, $.plugin.root)
+    controller = new RunController(store)
+    selectedDir = dir
+  }
+  /** 接受绝对路径、相对 cwd 的路径、或任务目录 basename */
+  const resolveTaskDir = async ($: any, ref: string): Promise<string> => {
+    const raw = ref.trim()
+    if (!raw) throw new Error('需要任务目录路径')
+    const candidates = raw.startsWith('/') ? [raw] : [path(raw, cwd), `${cwd}/${raw}`]
+    for (const candidate of candidates) {
+      if (await $.fs.exists(`${candidate}/state.sqlite3`)) return candidate
+    }
+    // basename：在工作区根下按前缀匹配唯一任务目录
+    const entries = await $.fs.list(cwd).catch(() => [])
+    const hits = (entries as any[])
+      .map(x => String(x?.name ?? x?.path ?? ''))
+      .filter(name => name === raw || name.startsWith(`${raw}-`))
+      .map(name => `${cwd}/${name}`)
+    if (hits.length === 1 && await $.fs.exists(`${hits[0]}/state.sqlite3`)) return hits[0]!
+    throw new Error(`找不到任务目录：${ref}（需要包含 state.sqlite3 的目录）`)
+  }
   const toolKey = (e: any) => String(e.toolUseId ?? e.tool_use_id ?? e.id ?? `${e.agentId ?? e.agent_id ?? 'main'}:${e.tool ?? e.tool_name ?? ''}`)
   const current = async () => selected && controller ? controller.get(selected) : undefined
   const event = async (type: string, fields: Record<string, unknown> = {}) => {
@@ -91,6 +135,61 @@ let opt: Record<string, unknown> = {}
     try { await $.fs.write(`${r.deliverDir}/manifest.json`, JSON.stringify(r, null, 2)) }
     catch { await $.ui.status('run 已事务保存；manifest 导出失败，可用 status 查询。') }
   }
+  // ---- 临时 worktree：每个 attempt 一个，结束后只回收声明的文件 ----
+  const repoRoot = async ($: any): Promise<string> => {
+    const res = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd, timeoutMs: 5000 }).catch(() => undefined)
+    return res && res.exitCode === 0 ? path(String(res.stdout).trim(), '') : ''
+  }
+  const makeWorkspace = async ($: any, dir: string, attemptId: string): Promise<string> => {
+    const root = await repoRoot($)
+    if (!root) return ''
+    const ws = `${dir}/workspaces/${attemptId}`
+    const res = await $.process.run(['git', 'worktree', 'add', '--detach', ws, 'HEAD'], { cwd: root, timeoutMs: 60000 }).catch(() => undefined)
+    return res && res.exitCode === 0 ? ws : ''
+  }
+  const dropWorkspace = async ($: any, ws: string): Promise<void> => {
+    if (!ws) return
+    await $.process.run(['git', 'worktree', 'remove', '--force', ws], { cwd, timeoutMs: 60000 }).catch(() => undefined)
+    const parent = ws.slice(0, ws.lastIndexOf('/'))
+    if (parent && parent.endsWith('/workspaces')) await $.process.run(['rmdir', parent], { cwd, timeoutMs: 5000 }).catch(() => undefined)
+  }
+  /** 把声明文件从 worktree 抄到 dest（默认项目路径），返回抄了哪些 */
+  const copyDeclared = async ($: any, r: Run, attempt: Attempt, dest?: string): Promise<{ files: string[]; complete: boolean }> => {
+    const task = r.tasks[attempt.taskId]
+    if (!task) return { files: [], complete: false }
+    if (!attempt.workspace) return { files: [], complete: true }
+    const root = await repoRoot($)
+    const files: string[] = []
+    for (const file of task.allowedFiles) {
+      const rel = root && file.startsWith(`${root}/`) ? file.slice(root.length + 1) : ''
+      if (!rel) continue
+      const src = `${attempt.workspace}/${rel}`
+      if (!(await $.fs.exists(src))) continue
+      const text = await $.fs.read(src).catch(() => undefined)
+      if (text === undefined) continue
+      await $.fs.write(dest ? `${dest}/${rel}` : file, text)
+      files.push(rel)
+    }
+    return { files, complete: files.length === task.allowedFiles.filter(f => root && f.startsWith(`${root}/`)).length && files.length > 0 }
+  }
+  /** 打断/结束时收敛：停 worker → 抢救产物 → attempt-ended */
+  const shutdown = async ($: any, r: Run, reason: string) => {
+    let latest = r
+    for (const attempt of Object.values(latest.attempts)) {
+      if (!attempt.managed || ATTEMPT_TERMINAL.has(attempt.status)) continue
+      const stopped = attempt.agentId ? await stopAgent($, attempt.agentId) : { ok: true }
+      if (attempt.workspace) {
+        const salvageDir = `${latest.deliverDir}/salvage/${attempt.id}`
+        const copied = await copyDeclared($, latest, attempt, salvageDir).catch(() => ({ files: [], complete: false }))
+        await $.fs.write(`${salvageDir}/README.md`, `attempt ${attempt.id}\n状态：${attempt.status}\n原因：${reason}\n已抢救：${copied.files.join(', ') || '无'}\n`)
+        latest = await event('salvage', { attemptId: attempt.id, dir: salvageDir, files: copied.files, complete: copied.complete })
+        await dropWorkspace($, attempt.workspace)
+      }
+      latest = await event('attempt-ended', { attemptId: attempt.id, reason, stopConfirmed: stopped.ok })
+    }
+    return latest
+  }
+
   const reconcile = async ($: any, r: Run) => {
     const rows = await listAgents($)
     if (rows === undefined) return '宿主列表查询失败；保留原状态，不推断失败。'
@@ -103,7 +202,7 @@ let opt: Record<string, unknown> = {}
         await event('attempt-started', { attemptId: a.id, agentId: hit.id, resolvedModel: a.resolvedModel ?? a.requestedModel })
       }
       if (!hit) {
-        await event('attempt-unknown', { attemptId: a.id, reason: '当前宿主列表不可见；未确认终止，不自动重派' })
+        await event('attempt-ended', { attemptId: a.id, reason: '宿主已不可见；按会话结束收敛', stopConfirmed: false })
       } else if (/^(running|pending|queued)$/.test(hit.status)) {
         await event('attempt-reconciled', { attemptId: a.id, status: 'running' })
       } else if (/^(completed|done)$/.test(hit.status)) {
@@ -115,21 +214,24 @@ let opt: Record<string, unknown> = {}
     return `宿主当前可见 ${rows.length} 个；列表为空不等于从未启动或失败。`
   }
   const start = async ($: any, a: any) => {
-    if (!controller || !store) throw new Error(startupError || '存储未初始化')
-    if (await active()) throw new Error('当前已有未关闭 run；先完成或明确取消，不覆盖它。')
-    const unfinished = (await store.list()).filter(r => !TERMINAL.has(r.status))
-    if (unfinished.length) throw new Error(`项目仍有未关闭 run：${unfinished.map(r => `${r.id} owner=${r.ownerSessionId}`).join(', ')}。先恢复原 owner 并处理；不创建可能冲突的执行。`)
     const ms = typeof a.budgetMs === 'number' ? a.budgetMs : parseDuration(String(a.duration ?? '5m'))
     if (!ms || !Number.isFinite(ms) || ms <= 0) throw new Error('预算必须是正时长')
     const id = makeRunId(now(), String(a.task ?? '任务'))
-    const r = await controller.create({ id, project: cwd, sessionId, task: String(a.task ?? ''), budgetMs: ms, now: now(), deliverDir: `${cwd}/.budget/runs/${id}` })
+    const dir = `${cwd}/${id}`
+    await $.fs.write(`${dir}/cards/.gitkeep`, '')
+    // 任务目录是本地副产物：只在本地排除，不改动受版本控制的 .gitignore
+    const gitDir = await $.process.run(['git', 'rev-parse', '--git-path', 'info/exclude'], { cwd, timeoutMs: 5000 }).catch(() => undefined)
+    if (gitDir && gitDir.exitCode === 0) {
+      const target = path(String(gitDir.stdout).trim(), cwd)
+      const existing = await $.fs.read(target).catch(() => '')
+      if (!existing.includes(`${id}/`)) await $.fs.write(target, `${existing}${existing.endsWith('\n') || !existing ? '' : '\n'}${id}/\n`)
+    }
+    await openTask($, dir)
+    const r = await controller!.create({ id, project: cwd, sessionId, task: String(a.task ?? ''), budgetMs: ms, now: now(), deliverDir: dir })
     selected = r.id
     const cadence = typeof a.cadence === 'object' ? a.cadence : extractCadence(String(a.cadence ?? '')).cadence
     await event('configure', { config: { step: cadence?.kind === 'fraction' ? cadence.step : Number(opt.default_step_percent ?? 10) / 100, cadenceMs: cadence?.kind === 'interval' ? cadence.ms : undefined, extraMarksMs: a.extraMarksMs ?? [] } })
-    await $.fs.write(`${r.deliverDir}/cards/.gitkeep`, '')
-    await $.fs.write(`${r.deliverDir}/.gitignore`, '*\n')
-    await $.fs.write(`${r.deliverDir}/.ignore`, '*\n')
-    return `已创建 ${r.id}，预算 ${fmt(ms)}。\n任务卡写入 ${r.deliverDir}/cards/，dispatch 的 card_path 传路径；每个 worker 必须声明独立 files。所有问题使用 AskUserQuestion。暂停预算不暂停 worker。\n${HELP}`
+    return `已创建任务目录 ${dir}，预算 ${fmt(ms)}。\n任务卡放 ${dir}/cards/ 或任意路径；dispatch 的 card_path 传路径。每个 worker 声明独立 files（会跑在临时 worktree 里）。所有问题使用 AskUserQuestion；暂停预算不暂停 worker。\n${HELP}`
   }
   const targets = (r: Run, name: string | undefined) => {
     const managed = Object.values(r.attempts).filter(a => a.managed && !ATTEMPT_TERMINAL.has(a.status))
@@ -140,21 +242,44 @@ let opt: Record<string, unknown> = {}
     if (a.action === 'help') return HELP
     if (a.action === 'decline') { declined = true; return '本会话不再提示开启预算。' }
     if (a.action === 'start') return start($, a)
-    if (a.action === 'list') return JSON.stringify(await store?.list() ?? [], null, 2)
-    if (a.action === 'recover') {
-      if (!controller || !a.run) throw new Error('recover 必须明确提供 run ID')
-      const r = await controller.get(a.run)
-      if (!r) throw new Error('run 不存在')
-      owned(r)
-      selected = r.id
-      if (TERMINAL.has(r.status)) return `已选择关闭 run 供 probe/stop 清理；不会恢复任务执行。\n${status(r)}`
-      await event('recover', { sessionId })
-      timerFault = ''
-      const note = await reconcile($, r)
-      return `${note}\n${status((await current())!)}`
+    if (a.action === 'list') {
+      const entries = await $.fs.list(cwd).catch(() => [])
+      const dirs: string[] = []
+      for (const entry of entries as any[]) {
+        const name = String(entry?.name ?? entry?.path ?? '')
+        if (name && await $.fs.exists(`${cwd}/${name}/state.sqlite3`)) dirs.push(`${cwd}/${name}`)
+      }
+      const rows: any[] = []
+      for (const dir of dirs.sort().reverse()) {
+        try {
+          const probe = await createRunStore($, dir, $.plugin.root)
+          for (const row of await probe.list()) rows.push({ ...row, taskDir: dir })
+        } catch { rows.push({ taskDir: dir, error: '状态库不可读' }) }
+      }
+      return JSON.stringify(rows, null, 2)
     }
-    let r = a.run && a.action === 'status' ? await controller?.get(a.run) : await current()
-    if (a.action === 'status') return r ? status(r) : `没有选中的 run。${startupError || '用 list 查询持久化记录。'}`
+    if (a.action === 'recover') {
+      if (!a.run) throw new Error('recover 需要任务目录路径（或目录名）')
+      const dir = await resolveTaskDir($, a.run)
+      await openTask($, dir)
+      selected = dir.split('/').pop()!
+      const found = await controller!.get(selected)
+      if (!found) throw new Error(`${dir} 里没有可识别的 run`)
+      if (TERMINAL.has(found.status)) return `已关闭的任务，仅可查看。\n${status(found)}`
+      await event('recover', { sessionId })
+      const resumed = await event('cycle-start')
+      timerFault = ''
+      const note = await reconcile($, resumed)
+      return `${note}\n\n继续：cycle=${resumed.cycle ?? 0}，阶段已重置为 ${resumed.phase}。\n${brief(resumed)}`
+    }
+    let r = await current()
+    if (a.action === 'status' && a.run) {
+      const dir = await resolveTaskDir($, a.run)
+      await openTask($, dir)
+      selected = dir.split('/').pop()!
+      r = await current()
+    }
+    if (a.action === 'status') return r ? status(r) : `没有选中的任务。${startupError || '给一个任务目录路径，或先 start。'}`
     if (!r) throw new Error(startupError || '没有选中的 run')
     owned(r)
     if (TERMINAL.has(r.status) && !['probe','stop','view'].includes(a.action)) throw new Error('run 已关闭；仅允许查询或清理未结束的执行，不恢复工作')
@@ -216,15 +341,15 @@ let opt: Record<string, unknown> = {}
         const occupied = new Set(live.flatMap(w => r.tasks[w.taskId]?.allowedFiles ?? []))
         // Entire batch preflight before any spawn or side-effecting task registration.
         for (const w of parsed.workers) {
-          if (Object.values(r.tasks).some(t => t.label === w.label)) throw new Error(`label 已存在：${w.label}；不静默重复执行`)
+          if (Object.values(r.tasks).some(t => t.label === w.label && !taskDone(r, t))) throw new Error(`label 已存在且未完成：${w.label}；已完成任务请用 redo=true 显式重做`)
           w.card = path(w.card, cwd)
-          if (!w.card.startsWith(`${r.deliverDir}/cards/`) || /[\r\n]/.test(w.card)) throw new Error('card_path 必须是本 run cards/ 下的文件路径，不是正文')
+          if (/[\r\n]/.test(w.card) || !(await $.fs.exists(w.card))) throw new Error(`card_path 必须是一个存在的文件路径，不是正文：${w.card}`)
           const text = await $.fs.read(w.card)
           if (!text.trim()) throw new Error(`任务卡为空：${w.label}`)
           if (!w.files.length) throw new Error(`${w.label} 必须声明 files，不能默认无限制写入`)
           w.files = w.files.map(f => path(f, cwd))
           for (const f of w.files) {
-            if (!f.startsWith(`${cwd}/`) || f === `${cwd}/.budget/state.sqlite3` || (f.includes('/.budget/') && !f.startsWith(`${r.deliverDir}/`))) throw new Error(`非法文件归属：${f}`)
+            if (!f.startsWith(`${cwd}/`) || f.startsWith(`${r.deliverDir}/`)) throw new Error(`非法文件归属：${f}`)
             if (occupied.has(f)) throw new Error(`文件与其他执行冲突：${f}`)
             occupied.add(f)
           }
@@ -238,26 +363,28 @@ let opt: Record<string, unknown> = {}
             const name = `${workerName(r.id, w.label).slice(0, 40)}-${now().toString(36)}-${sequence}`
             const model = w.model.mode === 'route' ? w.model.route : w.model.mode === 'alias' ? w.model.alias : 'inherit'
             await event('task-added', { task: { id: taskId, label: w.label, cardPath: w.card, allowedFiles: w.files, attemptIds: [] } })
-            await event('attempt-created', { attempt: { id: attemptId, taskId, ownerSessionId: sessionId, name, requestedModel: model, status: 'creating', managed: true, createdAt: now(), updatedAt: now() } })
+            const workspace = await makeWorkspace($, r.deliverDir, attemptId)
+            await event('attempt-created', { attempt: { id: attemptId, taskId, ownerSessionId: sessionId, name, requestedModel: model, status: 'creating', managed: true, createdAt: now(), updatedAt: now(), cycle: r.cycle ?? 0, workspace } })
             if (w.model.mode === 'route') routes.set(name, w.model.route)
             try {
               const spawned = await spawnAgent($, {
-                name, description: w.description, cwd,
+                name, description: w.description, cwd: workspace || cwd,
                 subagentType: 'general-purpose', model: w.model.mode === 'alias' ? w.model.alias : undefined,
-                prompt: `${buildWorkerPrompt({ label: w.label, cardPath: w.card, runId: r.id, modelLabel: model })}\n稳定任务标识 ${taskId}，执行标识 ${attemptId}。只读取本卡，只写声明文件。预算由主控管理；如收到暂停/延长通知，以最新通知为准。`,
+                prompt: `${buildWorkerPrompt({ label: w.label, cardPath: w.card, runId: r.id, modelLabel: model, workspace })}\n稳定任务标识 ${taskId}，执行标识 ${attemptId}。工作目录是隔离副本；只读取本卡，只写声明文件。预算由主控管理；如收到暂停/延长通知，以最新通知为准。`,
               })
               if (!spawned.ok) {
-                await event('attempt-unknown', { attemptId, reason: `spawn 未确认成功：${spawned.note}；不能确定是否已创建，不自动重试` })
-                results.push(`${w.label}：创建结果待确认 ${spawned.note}`)
+                await event('attempt-ended', { attemptId, reason: `spawn 未确认成功：${spawned.note}`, stopConfirmed: false })
+                await dropWorkspace($, workspace)
+                results.push(`${w.label}：创建失败 ${spawned.note}`)
               } else {
                 await event('attempt-started', { attemptId, agentId: spawned.agentId, resolvedModel: spawned.model })
                 const normalizedModel = (s: string) => s.toLowerCase().replace(/\[[0-9]+[mk]\]/g, '')
                 if (w.model.mode === 'route' && normalizedModel(spawned.model) !== normalizedModel(w.model.route)) {
                   const stopped = await stopAgent($, spawned.agentId)
-                  if (stopped.ok) await event('attempt-finished', { agentId: spawned.agentId, outcome: 'failed', reason: `模型不匹配：请求 ${w.model.route}，宿主解析 ${spawned.model}，已停止` })
-                  else await event('attempt-unknown', { attemptId, reason: `模型不匹配且停止未确认：${spawned.model}` })
-                  results.push(`${w.label}：模型不匹配，${stopped.ok ? '已停止' : '需人工处理'}；不自动重派`)
-                } else results.push(`${w.label}：attempt=${attemptId} agent=${spawned.agentId} model=${spawned.model}`)
+                  await event('attempt-finished', { agentId: spawned.agentId, outcome: 'failed', reason: `模型不匹配：请求 ${w.model.route}，宿主解析 ${spawned.model}` })
+                  if (workspace) await dropWorkspace($, workspace)
+                  results.push(`${w.label}：模型不匹配，${stopped.ok ? '已停止' : '停止未确认'}；不自动重派`)
+                } else results.push(`${w.label}：attempt=${attemptId} agent=${spawned.agentId} model=${spawned.model}${workspace ? '（worktree）' : '（共享工作区）'}`)
               }
             } finally { routes.delete(name) }
           }
@@ -285,14 +412,13 @@ let opt: Record<string, unknown> = {}
         try {
           const spawned = await spawnAgent($,{name,description:`重试 ${task.label}`,cwd,subagentType:'general-purpose',model:w.model.mode === 'alias' ? w.model.alias : undefined,prompt:buildWorkerPrompt({label:task.label,cardPath:task.cardPath,runId:r.id,modelLabel:previous.requestedModel}) + `\n这是显式重试 attempt=${attemptId}，原执行已确认失败。先检查现有产物，避免重复副作用。`})
           if (!spawned.ok) {
-            await event('attempt-unknown',{attemptId,reason:`重试创建结果未确认：${spawned.note}`})
-            return '重试创建结果未知，不会再次自动重试。'
+            await event('attempt-ended',{attemptId,reason:`重试创建失败：${spawned.note}`,stopConfirmed:false})
+            return '重试创建失败；任务仍待办，可在下次继续时重派。'
           }
           await event('attempt-started',{attemptId,agentId:spawned.agentId,resolvedModel:spawned.model})
           if (w.model.mode === 'route' && spawned.model.toLowerCase().replace(/\[[0-9]+[mk]\]/g,'') !== w.model.route.toLowerCase().replace(/\[[0-9]+[mk]\]/g,'')) {
-            const stopped = await stopAgent($,spawned.agentId)
-            if (stopped.ok) await event('attempt-finished',{agentId:spawned.agentId,outcome:'failed',reason:'重试模型不匹配，宿主确认停止'})
-            else await event('attempt-unknown',{attemptId,reason:'重试模型不匹配且停止未确认'})
+            await stopAgent($,spawned.agentId)
+            await event('attempt-finished',{agentId:spawned.agentId,outcome:'failed',reason:'重试模型不匹配'})
             return '重试模型不匹配，未继续宣称成功。'
           }
           return `新执行 attempt=${attemptId} agent=${spawned.agentId}；保留原失败记录。`
@@ -362,28 +488,11 @@ export const register: Register = (on, options) => {
   opt = options as Record<string, unknown>
   on('session.start', async ($, e, next) => {
     sessionId = await $.session.id(); cwd = path(e.cwd, '')
-    selected = undefined; controller = undefined; store = undefined; startupError = ''
+    selected = undefined; selectedDir = ''; controller = undefined; store = undefined; startupError = ''
     routes.clear(); asks.clear(); toolChecks.clear(); toolEdits.clear()
+    // Storage is opened lazily against a task directory: a task is addressed by its
+    // path, so nothing is bound to this session until start or recover names one.
     try {
-      store = await createRunStore($, cwd, $.plugin.root)
-      controller = new RunController(store)
-      const prior = (await store.list()).filter(r => r.ownerSessionId === sessionId && !TERMINAL.has(r.status)).sort((a,b) => b.updatedAt - a.updatedAt)[0]
-      if (prior) {
-        selected = prior.id
-        const r = (await current())!
-        if (r.status === 'interrupted') {
-          await $.ui.status(`发现中断 run=${r.id}。先 probe，再用 recover 明确恢复；不自动重新派发。`)
-        } else {
-          // A new process for the same owner session: do not count the offline gap and
-          // do not invent completion. Execution that was in flight becomes unknown until probe.
-          let fresh = await controller.dispatch(r.id, { type: 'checkpoint', now: r.updatedAt } as any)
-          for (const a of Object.values(fresh.attempts)) {
-            if (!a.managed || ['completed', 'failed'].includes(a.status) || a.status === 'unknown') continue
-            fresh = await controller.dispatch(r.id, { type: 'attempt-unknown', attemptId: a.id, reason: '进程重新初始化；宿主状态待 probe 确认', now: fresh.updatedAt } as any)
-          }
-          await $.ui.status(`已接续 run=${r.id}（不重复执行）。先 probe 对账未确认的执行。`)
-        }
-      }
       const home = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME') || await $.env.get('USERPROFILE')}/.claude`
       catalog = parseCatalog(await $.fs.read(`${home}/settings.json`))
     } catch (e) { startupError = String(e); await $.ui.status(`编排初始化：${startupError.slice(0, 180)}`) }
@@ -446,11 +555,8 @@ export const register: Register = (on, options) => {
     return next(e)
   })
   on('classic.SubagentStop', async ($, e: any, next) => {
-    const r = await current()
-    if (r && Object.values(r.attempts).some(a=>a.agentId === e.agent_id && !ATTEMPT_TERMINAL.has(a.status))) {
-      // A stop hook alone is not success evidence. turn.complete supplies normal completion.
-      await event('attempt-finished',{agentId:e.agent_id,outcome:'interrupted',reason:'宿主停止事件，尚无正常完成确认'})
-    }
+    // Host stop is not success evidence and not an interruption of the task:
+    // turn.complete decides success, shutdown decides ended. Nothing to record here.
     return next(e)
   })
   on('tool.call', async ($, e: any, next) => {
@@ -477,7 +583,16 @@ export const register: Register = (on, options) => {
         if (['Agent','Skill'].includes(tool)) return {deny:'managed worker 不得派生代理。'} as any
         if (WRITES.has(tool)) {
           const file = e.file_path ?? e.notebook_path
-          if (typeof file !== 'string' || !allowed(file,r.tasks[a.taskId]?.allowedFiles ?? [],cwd)) return {deny:'写入目标不在当前任务明确声明的 files 内。'} as any
+          if (typeof file !== 'string') return {deny:'写入目标不明确。'} as any
+          const declared = r.tasks[a.taskId]?.allowedFiles ?? []
+          const base = a.workspace || cwd
+          const target = path(file, base)
+          if (a.workspace) {
+            // 隔离副本里的相对路径映射回项目声明路径再校验
+            if (!target.startsWith(`${a.workspace}/`)) return { deny: `这是隔离副本；请用相对路径写入，不要写主工作树路径：${file}` } as any
+            const mapped = `${cwd}/${target.slice(a.workspace.length + 1)}`
+            if (!allowed(mapped, declared, cwd)) return { deny: '写入目标不在当前任务明确声明的 files 内。' } as any
+          } else if (!allowed(target, declared, cwd)) return {deny:'写入目标不在当前任务明确声明的 files 内。'} as any
         }
       }
     }
@@ -506,7 +621,19 @@ export const register: Register = (on, options) => {
     const r = await current()
     if (!r) return next(e)
     if (e.agentId) {
-      if (Object.values(r.attempts).some(a=>a.agentId===e.agentId)) await event('attempt-finished',{agentId:e.agentId,outcome:'completed',actualModel:e.usage?.model,reason:'宿主 turn.complete 确认'})
+      const attempt = Object.values(r.attempts).find(a => a.agentId === e.agentId)
+      if (attempt) {
+        // 回收声明文件 → 记录 merge → 才算完成
+        let after = r
+        const copied = await copyDeclared($, r, attempt).catch(() => ({ files: [], complete: false }))
+        const task = r.tasks[attempt.taskId]
+        const status = !attempt.workspace ? 'skipped' as const
+          : copied.complete ? 'done' as const
+          : copied.files.length ? 'partial' as const : 'conflict' as const
+        after = await event('merge', { attemptId: attempt.id, status, detail: copied.files.join(',') || (task ? '未回收任何声明文件' : '') })
+        await event('attempt-finished', { agentId: e.agentId, outcome: 'completed', actualModel: e.usage?.model, reason: `宿主完成；回收 ${copied.files.length} 个文件` })
+        if (attempt.workspace) await dropWorkspace($, attempt.workspace)
+      }
     } else if (!r.pauses.idle) await event('pause',{reason:'idle'})
     return next(e)
   })
@@ -521,9 +648,20 @@ export const register: Register = (on, options) => {
     } else if (!r.pauses.idle) await event('pause',{reason:'idle'})
     return next(e)
   })
+  on('turn.abort', async ($, e: any, next) => {
+    const r = await active()
+    if (r) await shutdown($, r, '主回合被中止（用户打断）：worker 随会话终止').catch(() => undefined)
+    return next(e)
+  })
   on('session.end', async ($, e: any, next) => {
     const r = await active()
-    if (r) { const interrupted = await event('interrupt',{reason:`会话结束：${String(e.reason)}；不是用户取消任务`}); await writeManifest($,interrupted) }
+    if (r) {
+      // worker 的生命周期跟随主会话：收敛为 ended，抢救产物，再标记任务中断
+      const settledRun = await shutdown($, r, `会话结束（${String(e.reason)}）：worker 随会话终止`).catch(() => r)
+      const interrupted = await event('interrupt', { reason: `会话结束：${String(e.reason)}` })
+      await writeManifest($, interrupted)
+      void settledRun
+    }
     return next(e)
   })
 }

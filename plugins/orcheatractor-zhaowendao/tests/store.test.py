@@ -95,56 +95,6 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(sum(result.returncode == 0 for result in results), 1)
         self.assertEqual(self.load(), self.run)
 
-    def test_concurrent_different_ids_allow_only_one_active_run(self):
-        def contender(index):
-            run = dict(self.run, id=f"candidate-{index}", ownerSessionId=f"session-{index}")
-            return run, self.save(run)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(contender, range(2)))
-        winners = [run for run, result in results if result.returncode == 0]
-        self.assertEqual(len(winners), 1)
-        for run, result in results:
-            if result.returncode:
-                self.failure(result)
-                self.assertIn("active run already exists", result.stderr)
-                self.assertIsNone(self.success(self.cli("load", "--id", run["id"])))
-        self.assertEqual(len(self.success(self.cli("list"))), 1)
-        self.assertEqual(self.success(self.cli("load", "--id", winners[0]["id"])), winners[0])
-
-    def test_terminal_runs_allow_new_run(self):
-        self.success(self.save())
-        second = dict(self.run, id="run-2", ownerSessionId="session-2")
-        self.failure(self.save(second))
-        self.success(self.save(dict(self.run, revision=1, status="completed"), 0))
-        self.success(self.save(second))
-        self.success(self.save(dict(second, revision=1, status="cancelled"), 0))
-        self.success(self.save(dict(self.run, id="run-3")))
-        self.assertEqual(len(self.success(self.cli("list"))), 3)
-
-    def test_terminal_unresolved_managed_attempts_block_new_run(self):
-        # Each terminal status and every unresolved host state retain the lock.
-        for terminal in ("cancelled", "completed"):
-            for status in ("creating", "running", "interrupted", "unknown"):
-                with self.subTest(terminal=terminal, status=status):
-                    self.db = Path(self.temp.name) / terminal / status / "state.sqlite3"
-                    previous = dict(self.run, status=terminal, attempts={
-                        "managed": {"managed": True, "status": status},
-                        "observed": {"managed": False, "status": "unknown"},
-                    })
-                    self.success(self.save(previous))
-                    next_run = dict(self.run, id="next-run")
-                    result = self.save(next_run)
-                    self.failure(result)
-                    self.assertIn("unresolved managed attempts", result.stderr)
-                    self.assertIsNone(self.success(self.cli("load", "--id", "next-run")))
-                    self.assertEqual(self.load(), previous)
-                    settled = copy.deepcopy(previous)
-                    settled["revision"] = 1
-                    settled["attempts"]["managed"]["status"] = "failed"
-                    self.success(self.save(settled, 0))
-                    self.success(self.save(next_run))
-
     def test_list_is_summary_only(self):
         self.assertEqual(self.success(self.cli("list")), [])
         self.success(self.save())

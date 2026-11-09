@@ -88,23 +88,8 @@ def execute(args):
         if expected is None:
             if row is not None:
                 raise StoreError("revision conflict: run already exists")
-            # Serialize project admission with the insert, not a bridge-side
-            # list check: different IDs must not bypass single-active-run safety.
-            active = connection.execute("""SELECT 1 FROM runs
-                WHERE status NOT IN ('completed', 'cancelled') LIMIT 1""").fetchone()
-            if active is not None:
-                raise StoreError("active run already exists for this project")
-            # Terminal status does not prove that host-managed writers stopped.
-            # Keep admission blocked until their late completion/stop is saved.
-            for (snapshot,) in connection.execute("SELECT snapshot FROM runs"):
-                previous = decode(snapshot)
-                attempts = previous.get("attempts", {})
-                if not isinstance(attempts, dict):
-                    raise StoreError("invalid stored attempts")
-                if any(isinstance(attempt, dict) and attempt.get("managed") is True
-                       and attempt.get("status") not in ("completed", "failed")
-                       for attempt in attempts.values()):
-                    raise StoreError("unresolved managed attempts")
+            # Each task directory owns its own database, so there is no project-wide
+            # single-active-run admission to enforce here.
         elif row is None or row[0] != expected:
             raise StoreError("revision conflict")
         values = (run["revision"], run["ownerSessionId"], run["status"],

@@ -128,6 +128,8 @@ export type WorkerPromptInput = {
   runId: string
   deadline?: string
   modelLabel?: string
+  /** 隔离副本根目录；为空表示共享工作区 */
+  workspace?: string
 }
 
 /** 自包含 prompt：子代理看不到主会话，必须让它先读任务卡。 */
@@ -136,6 +138,9 @@ export function buildWorkerPrompt(p: WorkerPromptInput): string {
     `你是 ${p.label}，本次预算 run=${p.runId} 的原生子代理${p.modelLabel ? `（模型 ${p.modelLabel}）` : ''}。`,
     `先完整读取任务卡：${p.cardPath}`,
     '严格按卡执行；只改卡里「允许改动」的文件；不要使用 Skill 或 Agent 再派生子代理；不要运行 git 命令。',
+    ...(p.workspace
+      ? [`你的工作目录是隔离副本：${p.workspace}。Write/Edit 必须使用这个目录下的绝对路径，不要写主工作树的路径；完成后只回收声明文件。`]
+      : []),
   ]
   if (p.deadline) {
     lines.push(`你的截止时间：${p.deadline}。做完手上这一小块就停，跑卡里的自检，然后按卡的格式汇报。`)

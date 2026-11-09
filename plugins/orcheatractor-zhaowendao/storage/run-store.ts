@@ -9,10 +9,10 @@ export type RunSummary = {
   deliverDir: string;
 };
 
-/** All reads and writes go to SQLite through the host process API. */
+/** All reads and writes go to SQLite inside the task directory. */
 export async function createRunStore(
   $: any,
-  project: string,
+  taskDir: string,
   pluginRoot: string,
 ): Promise<RunStore & { list(): Promise<RunSummary[]> }> {
   let python: string[] | undefined;
@@ -33,7 +33,7 @@ export async function createRunStore(
   if (!python) {
     throw new Error('Budget disabled: Python 3 with sqlite3 is required for durable storage (tried python3, python, py -3).');
   }
-  const command = [...python, '-I', `${pluginRoot}/storage/store.py`, '--db', `${project}/.budget/state.sqlite3`];
+  const command = [...python, '-I', `${pluginRoot}/storage/store.py`, '--db', `${taskDir}/state.sqlite3`];
   async function invoke(action: 'load' | 'save' | 'list', args: string[] = []): Promise<unknown> {
     let result;
     try {
