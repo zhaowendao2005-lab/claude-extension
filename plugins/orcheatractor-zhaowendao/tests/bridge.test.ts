@@ -32,7 +32,7 @@ function harness() {
       run: async (args: string[]) => {
         if (args[0] === 'git') return { exitCode: 1, stdout: '', stderr: 'no repo' }
         if (args.includes('-c')) return { exitCode: 0, stdout: '', stderr: '' }
-        const value = (k: string) => args[args.indexOf(k) + 1]
+        const value = (k: string) => args[args.indexOf(k) + 1]!
         const action = value('--action'), id = value('--id')
         if (action === 'list') return { exitCode: 0, stdout: JSON.stringify([...db.values()].map(r => ({ id: r.id, ownerSessionId: r.ownerSessionId, status: r.status, updatedAt: r.updatedAt, deliverDir: r.deliverDir }))), stderr: '' }
         if (action === 'load') return { exitCode: 0, stdout: JSON.stringify(db.get(id) ?? null), stderr: '' }
@@ -91,7 +91,7 @@ test('interrupt settles workers to ended instead of pretending success', async (
   const h = harness(); await h.emit('session.start', { cwd: '/ws' }); await h.budget({ action: 'start', duration: '5m' })
   const dir = h.run().deliverDir; h.files.set(`${dir}/cards/a.md`, 'task')
   await h.budget({ action: 'dispatch', workers: [{ label: 'a', model: 'sonnet', card_path: `${dir}/cards/a.md`, files: ['/ws/out/a.json'] }] })
-  expect(Object.values(h.run().attempts)[0].status).toBe('running')
+  expect((Object.values(h.run().attempts)[0] as any).status).toBe('running')
   await h.emit('turn.abort')
   const attempt: any = Object.values(h.run().attempts)[0]
   expect(attempt.status).toBe('ended')
@@ -156,4 +156,14 @@ test('slash command defers task handoff to turn.complete', async () => {
   expect(h.submitted()).toBe(0)
   await h.emit('turn.complete', {})
   expect(h.submitted()).toBe(1)
+})
+
+test('the help command prints Chinese usage without creating a run', async () => {
+  const h = harness(); await h.emit('session.start', { cwd: '/ws' })
+  const result: any = await h.emit('command.run', { command: 'orcheatractor-zhaowendao-help' })
+  expect(result.text).toContain('/orcheatractor-zhaowendao 20m')
+  expect(result.text).toContain('salvage/')
+  expect(result.text).toContain('/orcheatractor-zhaowendao-help')
+  expect(h.submitted()).toBe(0)
+  expect(h.db.size).toBe(0)
 })

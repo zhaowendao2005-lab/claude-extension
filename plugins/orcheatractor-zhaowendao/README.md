@@ -2,6 +2,16 @@
 
 给主 agent 和它派发的 worker 一个时间预算与可继续的任务记录。
 
+## 斜杠命令
+
+| 命令 | 说明 |
+|---|---|
+| `/orcheatractor-zhaowendao <时长> <任务>` | 创建任务目录并开始计时，例如 `20m 重构登录模块` |
+| `/orcheatractor-zhaowendao 状态` | 查看当前任务 |
+| `/orcheatractor-zhaowendao 延时 10m` | 延长预算 |
+| `/orcheatractor-zhaowendao 关闭` | 取消任务 |
+| `/orcheatractor-zhaowendao-help` | 显示完整中文用法（不创建任务、不产生模型回合） |
+
 ## 任务目录（按路径寻址）
 
 ```text

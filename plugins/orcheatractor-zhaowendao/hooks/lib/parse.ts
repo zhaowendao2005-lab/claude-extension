@@ -35,7 +35,7 @@ export function cnToNumber(s: string): number {
     if (hi === undefined || lo === undefined) return NaN
     return hi * 10 + lo
   }
-  if (s.length === 1 && s in CN_DIGITS) return CN_DIGITS[s]
+  if (s.length === 1 && s in CN_DIGITS) return CN_DIGITS[s]!
   return NaN
 }
 
@@ -66,7 +66,7 @@ export function findDurations(text: string): DurationHit[] {
     } else {
       const n = cnToNumber(m[1] ?? '')
       if (!Number.isFinite(n)) continue
-      const unit = unitMs(m[3])
+      const unit = unitMs(m[3]!)
       ms = n * unit + (m[2] || m[4] ? unit / 2 : 0)
     }
     const hit = { ms, index: m.index ?? 0, length: m[0].length, text: m[0] }
@@ -87,7 +87,7 @@ export function parseDuration(s: string): number | undefined {
   const t = s.trim()
   if (/^\d+(\.\d+)?$/.test(t)) return Number(t) * 60_000
   const hits = findDurations(t)
-  return hits.length ? hits[0].ms : undefined
+  return hits.length ? hits[0]!.ms : undefined
 }
 
 /** 从参数里取出节奏设置，返回设置和去掉这些片段后的剩余文本。 */
@@ -138,7 +138,7 @@ export function parseBudgetArgs(args: string): BudgetCommand {
   if (/^(清理|clean)$/i.test(a)) return { action: 'clean' }
   const ext = a.match(/^(?:延时|延长|延期|extend|\+)\s*(.+)$/i)
   if (ext) {
-    const ms = parseDuration(ext[1])
+    const ms = parseDuration(ext[1]!)
     return ms ? { action: 'extend', ms } : { action: 'error', message: `看不懂延时长度：${ext[1]}` }
   }
 

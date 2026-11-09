@@ -6,6 +6,7 @@ import { createRunStore } from '../storage/run-store'
 import { parseBudgetArgs, parseDuration, extractCadence, detectTimeRequirement } from './lib/parse'
 import { fmt, makeRunId } from './lib/schedule'
 import { parseCatalog, type CatalogEntry } from './lib/models'
+import { USAGE } from './lib/help'
 import { parseDispatch, buildWorkerPrompt, workerName } from './lib/dispatch'
 import { listAgents, spawnAgent, sendTo, stopAgent, agentMessages } from './lib/runtime'
 import { registerModelSearchCommand } from './model-search'
@@ -17,7 +18,7 @@ const CHECK = /^(tsc|eslint|biome|mypy|pyright|ruff|go\s+(build|vet)|cargo\s+(ch
 function isCheckCommand(command: string): boolean {
   return CHECK.test(command.trim()) && !/[;&|<>`$\r\n]/.test(command)
 }
-const HELP = '编排内核 v2：start / status / list / dispatch / retry / probe / recover / resume / phase / plan / extend / gate / close / cancel / card / say / stop / view / ref。card_path 是文件路径。跨 session 记录只读，不自动接管、不自动重试。Ask 等待暂停主预算，不停止 worker 或模型费用。'
+const HELP = '编排内核 v2：start / status / list / dispatch / retry / probe / recover / resume / phase / plan / extend / gate / close / cancel / card / say / stop / view / ref。card_path 是文件路径。跨 session 记录只读，不自动接管、不自动重试。Ask 等待暂停主预算，不停止 worker 或模型费用。完整中文用法：/orcheatractor-zhaowendao-help。'
 function path(value: string, cwd: string): string {
   const raw = value.replace(/\\/g, '/')
   const absolute = /^(\/|[A-Za-z]:\/)/.test(raw) ? raw : `${cwd}/${raw}`
@@ -521,6 +522,7 @@ export const register: Register = (on, options) => {
     const configured = Number(opt.max_concurrent_workers)
     maxWorkers = Math.max(1, Math.min(envCap, Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : envCap))
     await $.command.register({ name: 'orcheatractor-zhaowendao', description: '持久化编排与预算状态机', argumentHint: '10m 任务 | 状态 | 延时 5m | 关闭', immediate: true })
+    await $.command.register({ name: 'orcheatractor-zhaowendao-help', description: '查看编排插件的中文用法', immediate: true })
     await registerModelSearchCommand($)
     await $.tool.register({ name: 'budget', description: HELP, isDeferred: true, inputSchema: {
       type: 'object', properties: {
@@ -554,6 +556,7 @@ export const register: Register = (on, options) => {
       return { text, context: task ? [text, `用户交给你的任务：${task}`] : [text] }
     } catch (e) { return {text:`编排操作失败：${String(e).slice(0,500)}`} }
   })
+  on('command.run', {command:'orcheatractor-zhaowendao-help'}, async () => ({ text: USAGE }))
   on('tool.call', {tool:'mcp__orcheatractor-zhaowendao__budget'}, async ($, e: any) => {
     try { return {result:[{type:'text',text:await runAction($,e)}]} }
     catch (err) { return {result:[{type:'text',text:`编排操作失败：${String(err).slice(0,600)}`}],isError:true} }

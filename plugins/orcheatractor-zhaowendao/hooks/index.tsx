@@ -8,5 +8,5 @@ import { register as registerBudget } from './register'
 // - model-search.tsx：模糊搜索切换模型（/model-search）
 export const register: Register = (on, options) => {
   registerBudget(on, options)
-  registerModelSearch(on)
+  registerModelSearch(on, options)
 }

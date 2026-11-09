@@ -15,7 +15,8 @@ export type DispatchWorker = {
   label: string
   /** 主 agent 写的模型：完整 route、catalog 子串、内置别名或 inherit */
   rawModel: string
-  model: ResolvedModel
+  /** parseDispatch 已拒绝解析失败的模型，所以这里只可能是成功分支 */
+  model: Extract<ResolvedModel, { ok: true }>
   /** 任务卡路径（绝对或项目根相对，由调用方规范化） */
   card: string
   description: string
