@@ -9,7 +9,7 @@ function harness() {
   }
   register(on, {} as any)
   const db = new Map<string, any>(), files = new Map<string, string>()
-  let submitted = 0, serial = 0, session = 'session-a'
+  let submitted = 0, deferred = 0, serial = 0, session = 'session-a'
   const pathOf = (k: string) => k
   const $: any = {
     plugin: { root: '/plugin' },
@@ -25,7 +25,7 @@ function harness() {
     command: { register: async () => {} },
     tool: { register: async () => {}, call: async () => ({ success: true }) },
     ui: { status: async () => {} },
-    clock: { every: () => {} },
+    clock: { every: () => {}, after: (_ms: number, fn: () => void) => { deferred++; void Promise.resolve().then(fn) } },
     prompt: { submit: async () => { submitted++ } },
     agent: { list: async () => [], spawn: async () => ({ agentId: `agent-${++serial}`, model: 'sonnet' }) },
     process: {
@@ -56,7 +56,7 @@ function harness() {
   }
   const run = () => [...db.values()][0]
   const cards = () => { const d = run().deliverDir; files.set(`${d}/cards/a.md`, 'task a'); return `${d}/cards/a.md` }
-  return { $, emit, budget, run, db, files, hooks, cards, submitted: () => submitted, setSession: (s: string) => { session = s } }
+  return { $, emit, budget, run, db, files, hooks, cards, submitted: () => submitted, scheduled: () => deferred, setSession: (s: string) => { session = s } }
 }
 
 test('start creates a timestamped task directory at the workspace root', async () => {
@@ -65,7 +65,12 @@ test('start creates a timestamped task directory at the workspace root', async (
   expect(text.text).toContain('/ws/')
   expect(h.run().deliverDir.startsWith('/ws/')).toBe(true)
   expect(h.files.has(`${h.run().deliverDir}/cards/.gitkeep`)).toBe(true)
+  // 刚建好预算还没干活：先停表，等用户消息再开始计时
+  expect(h.run().status).toBe('paused')
+  expect(h.run().pauses.idle).toBe(1)
+  await h.emit('prompt.submit', { text: '开始', origin: { kind: 'user' } })
   expect(h.run().status).toBe('running')
+  expect(h.run().pauses.idle).toBe(undefined)
 })
 
 test('Ask holds the clock through next(); worker activity does not resume it', async () => {
@@ -75,11 +80,11 @@ test('Ask holds the clock through next(); worker activity does not resume it', a
     await hook.fn(h.$, { tool: 'AskUserQuestion', toolUseId: 'ask1' }, async () => {
       expect(h.run().pauses['waiting_user:ask1']).toBe(1)
       await h.emit('tool.call', { tool: 'Read', agentId: 'external', toolUseId: 'r' })
-      expect(Object.keys(h.run().pauses).length).toBe(1)
+      expect(h.run().pauses['waiting_user:ask1']).toBe(1)
       throw new Error('cancelled')
     })
   } catch {}
-  expect(Object.keys(h.run().pauses).length).toBe(0)
+  expect(h.run().pauses['waiting_user:ask1']).toBe(undefined)
 })
 
 test('interrupt settles workers to ended instead of pretending success', async () => {
@@ -144,11 +149,11 @@ test('dispatch preflights the batch before spawning anything', async () => {
   expect(missing.isError).toBe(true); expect(spawned).toBe(0)
 })
 
-test('slash command never submits a prompt while holding its own turn', async () => {
+test('slash command defers task handoff to turn.complete', async () => {
   const h = harness(); await h.emit('session.start', { cwd: '/ws' })
   const result = await h.emit('command.run', { command: 'orcheatractor-zhaowendao', args: '5m 修登录' })
-  // 宿主禁止 command.run 里 prompt.submit（会等自己占着的这一轮）：必须零调用
-  expect(h.submitted()).toBe(0)
   expect(result.context.join('\n')).toContain('修登录')
-  expect(h.run().status).toBe('running')
+  expect(h.submitted()).toBe(0)
+  await h.emit('turn.complete', {})
+  expect(h.submitted()).toBe(1)
 })

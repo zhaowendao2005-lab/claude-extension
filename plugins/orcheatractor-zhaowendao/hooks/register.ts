@@ -78,7 +78,14 @@ let opt: Record<string, unknown> = {}
   let startupError = '', timerFault = ''
   let catalog: CatalogEntry[] = []
   let maxWorkers = 20, timerBusy = false, lastCheckpoint = 0, sequence = 0, dispatchBusy = false
+  /** 最近一次"确实有工作"的时刻；tick 用它兜底判定空闲，不依赖回合事件 */
+  let lastActivityAt = 0
+  const IDLE_MS = 120_000
   let declined = false
+  // slash command 不能在 command.run 内直接提交 prompt；先挂起，
+  // turn.complete 时提交，若命令本身没有模型回合，则由下一条用户消息承接。
+  let pendingTask = ''
+  let submittingPendingTask = false
   let actionTail: Promise<unknown> = Promise.resolve()
   const runAction = ($: any, args: any): Promise<string> => {
     const operation = actionTail.then(() => act($, args))
@@ -231,6 +238,8 @@ let opt: Record<string, unknown> = {}
     selected = r.id
     const cadence = typeof a.cadence === 'object' ? a.cadence : extractCadence(String(a.cadence ?? '')).cadence
     await event('configure', { config: { step: cadence?.kind === 'fraction' ? cadence.step : Number(opt.default_step_percent ?? 10) / 100, cadenceMs: cadence?.kind === 'interval' ? cadence.ms : undefined, extraMarksMs: a.extraMarksMs ?? [] } })
+    // 刚建好预算还没有任何工作：先停表，等真正的回合开始再走。
+    await event('pause', { reason: 'idle' })
     return `已创建任务目录 ${dir}，预算 ${fmt(ms)}。\n任务卡放 ${dir}/cards/ 或任意路径；dispatch 的 card_path 传路径。每个 worker 声明独立 files（会跑在临时 worktree 里）。所有问题使用 AskUserQuestion；暂停预算不暂停 worker。\n${HELP}`
   }
   const targets = (r: Run, name: string | undefined) => {
@@ -467,8 +476,18 @@ let opt: Record<string, unknown> = {}
     if (timerBusy || timerFault) return
     timerBusy = true
     try {
-      let r = await active()
-      if (!r || r.ownerSessionId !== sessionId || r.status === 'interrupted' || Object.keys(r.pauses).length) return
+      // 宿主不一定把 turn.start/turn.complete 交给插件，所以空闲判定由 tick 自己兜底：
+      // 只有 idle 一个暂停原因时，有活动就恢复，长时间无活动就停表。
+      let r = await current()
+      if (!r || r.ownerSessionId !== sessionId || r.status === 'interrupted' || TERMINAL.has(r.status)) return
+      const idleOnly = Object.keys(r.pauses).every(x => x === 'idle') && Object.keys(r.pauses).length > 0
+      const silentMs = now() - lastActivityAt
+      if (idleOnly && silentMs < IDLE_MS) { r = await event('resume', { reason: 'idle' }); lastCheckpoint = 0 }
+      else if (!Object.keys(r.pauses).length && lastActivityAt > 0 && silentMs >= IDLE_MS) {
+        r = await event('pause', { reason: 'idle' })
+        await $.ui.status(`⏱ ${fmt(elapsed(r, now()))} / ${fmt(r.budgetMs)}（空闲停表）`)
+        return
+      } else if (Object.keys(r.pauses).length) return
       if (now() - lastCheckpoint > 5000) { r = await event('checkpoint'); lastCheckpoint = now() }
       const used = elapsed(r, now())
       const interval = r.config?.cadenceMs || Math.max(1000, r.budgetMs * (r.config?.step ?? 0.1))
@@ -489,6 +508,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     sessionId = await $.session.id(); cwd = path(e.cwd, '')
     selected = undefined; selectedDir = ''; controller = undefined; store = undefined; startupError = ''
+    pendingTask = ''; submittingPendingTask = false
     routes.clear(); asks.clear(); toolChecks.clear(); toolEdits.clear()
     // Storage is opened lazily against a task directory: a task is addressed by its
     // path, so nothing is bound to this session until start or recover names one.
@@ -500,7 +520,7 @@ export const register: Register = (on, options) => {
     const envCap = Number.isFinite(rawCap) && rawCap > 0 ? Math.floor(rawCap) : 20
     const configured = Number(opt.max_concurrent_workers)
     maxWorkers = Math.max(1, Math.min(envCap, Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : envCap))
-    await $.command.register({ name: 'orcheatractor-zhaowendao', description: '持久化编排与预算状态机', argumentHint: '10m 任务 | 状态 | 延时 5m | 关闭' })
+    await $.command.register({ name: 'orcheatractor-zhaowendao', description: '持久化编排与预算状态机', argumentHint: '10m 任务 | 状态 | 延时 5m | 关闭', immediate: true })
     await registerModelSearchCommand($)
     await $.tool.register({ name: 'budget', description: HELP, isDeferred: true, inputSchema: {
       type: 'object', properties: {
@@ -522,9 +542,15 @@ export const register: Register = (on, options) => {
       if (cmd.action === 'error') return {text:cmd.message}
       const a = cmd.action === 'stop' ? {action:'cancel'} : cmd.action === 'extend' ? {action:'extend',minutes:String(cmd.ms / 60000)} : cmd
       const text = await runAction($, a)
-      // 不能在 command.run 里 prompt.submit（会等自己占着的这一轮）。任务通过
-      // context 交给主 agent，同一条命令结果里就能读到并开始执行。
+      // 宿主禁止在 command.run 里 prompt.submit（会等自己占着的这一轮）。
+      // 先保存待启动任务：若命令属于正在结束的模型回合，在 turn.complete 提交；
+      // 若是用户直接在空闲 prompt 执行的 slash command，则由下一条用户消息承接。
       const task = cmd.action === 'start' && cmd.task ? String(cmd.task) : ''
+      if (task) {
+        pendingTask = task
+        // Do not call prompt.submit here: the host rejects a submission from its own command.run hook.
+        // The task is retained durably in the command context and submitted from turn.complete.
+      }
       return { text, context: task ? [text, `用户交给你的任务：${task}`] : [text] }
     } catch (e) { return {text:`编排操作失败：${String(e).slice(0,500)}`} }
   })
@@ -535,11 +561,30 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e: any, next) => {
     const r = await active()
-    if (r && !e.agentId && r.status !== 'interrupted') await event('resume',{reason:'idle'})
+    if (r && !e.agentId && r.status !== 'interrupted') {
+      lastActivityAt = now()
+      if (r.pauses.idle) await event('resume',{reason:'idle'})
+    }
     return next(e)
   })
   on('prompt.submit', async ($, e: any, next) => {
-    if (!declined && opt.auto_detect !== false && !await active() && !e.isMeta && e.origin?.kind !== 'plugin' && e.origin?.kind !== 'task-notification') {
+    // 直接运行 slash command 时宿主不会自动开启模型回合；下一条用户消息承接挂起任务。
+    const run = await active()
+    const userMessage = !e.isMeta && e.origin?.kind !== 'plugin' && e.origin?.kind !== 'task-notification'
+    if (run && userMessage) {
+      lastActivityAt = now()
+      if (run.pauses.idle) await event('resume', { reason: 'idle' })
+      if (pendingTask) {
+        const task = pendingTask
+        pendingTask = ''
+        return next({ ...e, text: `${task}\n\n${String(e.text ?? '')}`.trim() })
+      }
+    }
+    if (run && submittingPendingTask && run.pauses.idle) {
+      lastActivityAt = now()
+      await event('resume', { reason: 'idle' })
+    }
+    if (!declined && opt.auto_detect !== false && !run && userMessage) {
       const hit = detectTimeRequirement(String(e.text ?? ''))
       if (hit) await tell($,'发现时间要求。先用 AskUserQuestion 确认是否开启持久化预算；不要自动启动。')
     }
@@ -565,6 +610,8 @@ export const register: Register = (on, options) => {
     const r = await current()
     if (!r) return next(e)
     const tool = String(e.tool ?? ''), key = toolKey(e), agentId = e.agentId
+    // 主 agent 有工具调用 = 在干活；worker 的活动不解除"等用户"的暂停
+    if (!agentId) lastActivityAt = now()
     const attempt = agentId ? Object.values(r.attempts).find(a => a.agentId === agentId) : undefined
     if (attempt?.managed && (TERMINAL.has(r.status) || r.status === 'interrupted' || ATTEMPT_TERMINAL.has(attempt.status)) && (WRITES.has(tool) || ['Bash','Agent','Skill'].includes(tool))) {
       return {deny:'run 已关闭/中断或执行已结束，禁止继续写入或运行命令；先由主控确认恢复。'} as any
@@ -622,6 +669,19 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e: any, next) => {
     const r = await current()
     if (!r) return next(e)
+    if (!e.agentId && pendingTask) {
+      const task = pendingTask
+      pendingTask = ''
+      submittingPendingTask = true
+      try {
+        await $.prompt.submit({ text: task })
+      } catch (err) {
+        // Keep the task for the next user prompt if the host refuses this handoff.
+        pendingTask = task
+        await $.ui.status(`任务已登记但尚未开始：${String(err).slice(0, 160)}；发送下一条消息即可继续。`)
+      } finally { submittingPendingTask = false }
+      return next(e)
+    }
     if (e.agentId) {
       const attempt = Object.values(r.attempts).find(a => a.agentId === e.agentId)
       if (attempt) {
@@ -636,7 +696,7 @@ export const register: Register = (on, options) => {
         await event('attempt-finished', { agentId: e.agentId, outcome: 'completed', actualModel: e.usage?.model, reason: `宿主完成；回收 ${copied.files.length} 个文件` })
         if (attempt.workspace) await dropWorkspace($, attempt.workspace)
       }
-    } else if (!r.pauses.idle) await event('pause',{reason:'idle'})
+    } else if (!r.pauses.idle) { lastActivityAt = 0; await event('pause',{reason:'idle'}) }
     return next(e)
   })
   on('classic.Stop', async ($, e: any, next) => {
@@ -647,7 +707,7 @@ export const register: Register = (on, options) => {
       if (problems.length) return {block:`交付条件未满足：${problems.join('；')}。可明确取消，不能伪报完成。`}
       const closed = await event('complete',{reason:'验收完成，统一交付门禁通过'})
       await writeManifest($,closed)
-    } else if (!r.pauses.idle) await event('pause',{reason:'idle'})
+    } else if (!r.pauses.idle) { lastActivityAt = 0; await event('pause',{reason:'idle'}) }
     return next(e)
   })
   on('turn.abort', async ($, e: any, next) => {

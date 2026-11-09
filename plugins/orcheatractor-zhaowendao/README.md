@@ -29,9 +29,9 @@ start ──► active ──► completed
 - **worker 只在创建它的会话里有效**：手动打断、`session.end`、进程退出后，插件把所有未完成执行收敛为 `ended`（终态、不是成功），并把声明文件抢救到 `salvage/`。
 - **继续**：`budget action=recover run=<任务目录>`。允许新会话接管（旧执行已终态，不操作旧 worker），阶段回到 `pre-explore`，`cycle+1`；已完成的 task 不重做，未完成的重新派发。
 - 不存在 `unknown` 这种跨会话不确定态；状态只有 `creating/running/completed/failed/ended`。
-- 超时不是关闭：到期只通知收尾并要求主 agent 询问延期或取消。
-
-## worktree
+- `start` 会先创建任务目录并停表，等待真正的模型回合。
+- 如果命令是在一个正在结束的模型回合里调用，插件在 `turn.complete` 中自动提交任务。
+- 如果用户在空闲状态直接输入 slash command，宿主不会为 `command.run` 自动创建模型回合；此时命令会保留任务，**下一条用户消息会自动承接该任务**。这是宿主事件语义，不是插件吞掉了任务。
 
 每个 attempt 在临时 git worktree 中执行（`worktree add --detach`），结束后只把该任务**声明的 files** 复制回主工作树，然后删除 worktree。
 
