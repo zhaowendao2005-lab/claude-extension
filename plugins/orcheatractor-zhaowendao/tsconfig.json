@@ -8,10 +8,11 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "jsx": "react",
     "jsxFactory": "h",
     "jsxFragmentFactory": "Fragment"
   },
-  "include": [".claude-plugin/types", "hooks", "types", "tests"]
+  "include": [".claude-plugin/types", "hooks", "core", "storage", "types", "tests"]
 }

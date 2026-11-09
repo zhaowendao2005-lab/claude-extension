@@ -108,8 +108,10 @@ export function parseDispatch(raw: unknown, catalog: CatalogEntry[], maxWorkers 
     const model = resolveWorkerModel(rawModel, catalog)
     if (!model.ok) return { ok: false, error: `${label}.model：${model.error}` }
 
-    const card = typeof o.card === 'string' ? o.card.trim() : ''
-    if (!card) return { ok: false, error: `${label}.card 为空` }
+    const rawCard = o.card_path ?? o.card
+    const card = typeof rawCard === 'string' ? rawCard.trim() : ''
+    if (!card) return { ok: false, error: `${label}.card_path 为空（传文件路径，不是正文）` }
+    if (/[\r\n]/.test(card) || card.length > 4096) return { ok: false, error: `${label}.card_path 必须是单行文件路径` }
 
     const description = typeof o.description === 'string' && o.description.trim()
       ? o.description.trim().slice(0, 120)

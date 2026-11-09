@@ -56,7 +56,10 @@ export async function agentMessages($: any, agentId: string, limit = 12): Promis
 /** 给子代理发消息（主 agent 的 btw）。返回是否投递成功。 */
 export async function sendTo($: any, agentId: string, message: string): Promise<{ ok: boolean; note?: string }> {
   try {
-    await $.tool.call({ tool: 'SendMessage', to: agentId, message })
+    const result: any = await $.tool.call({ tool: 'SendMessage', to: agentId, message })
+    if (result?.isError === true || result?.deny !== undefined || result?.success === false) {
+      return { ok: false, note: String(result?.deny ?? result?.text ?? '宿主拒绝消息').slice(0, 160) }
+    }
     return { ok: true }
   } catch (e) {
     return { ok: false, note: String((e as any)?.message ?? e).slice(0, 160) }
@@ -67,7 +70,7 @@ export async function sendTo($: any, agentId: string, message: string): Promise<
 export async function stopAgent($: any, agentId: string): Promise<{ ok: boolean; note?: string }> {
   try {
     const r: any = await $.tool.call({ tool: 'TaskStop', task_id: agentId })
-    const failed = r?.isError === true || r?.deny !== undefined
+    const failed = !r || r?.isError === true || r?.deny !== undefined || r?.success === false
     return failed ? { ok: false, note: String(r?.text ?? r?.deny ?? '').slice(0, 160) } : { ok: true }
   } catch (e) {
     return { ok: false, note: String((e as any)?.message ?? e).slice(0, 160) }

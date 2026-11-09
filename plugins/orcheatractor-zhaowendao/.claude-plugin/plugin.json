@@ -1,8 +1,8 @@
 {
   "name": "orcheatractor-zhaowendao",
   "displayName": "编排、时间预算与模型搜索",
-  "version": "0.3.0",
-  "description": "统一编排原生 Agent 子代理与可选时间预算：一次 dispatch 并行启动多个 general-purpose worker、每个可指定模型，阶段计划、到期收尾和质量底线；并内置 /model-search 模糊搜索切换模型。默认关闭。",
+  "version": "0.4.0",
+  "description": "持久化编排内核：SQLite事务状态、Run/Task/Attempt生命周期、Ask等待停表、明确中断恢复与统一交付门禁；原生worker按文件分工，保留 /model-search。需要Python 3标准库sqlite3。",
   "author": {
     "name": "qihoo"
   },
@@ -15,12 +15,6 @@
       "type": "boolean",
       "title": "识别提示词里的时间要求",
       "description": "提示词里出现「10 分钟内完成」之类的要求时，让主 agent 先问你是否开启预算模式",
-      "default": true
-    },
-    "use_history": {
-      "type": "boolean",
-      "title": "使用历史校准数据",
-      "description": "做预算计划时读取以往运行汇总出的速度和偏差数字（只读数字，不读历史文档）",
       "default": true
     },
     "default_step_percent": {
