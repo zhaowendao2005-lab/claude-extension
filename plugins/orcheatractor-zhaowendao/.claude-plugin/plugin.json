@@ -1,7 +1,7 @@
 {
   "name": "orcheatractor-zhaowendao",
   "displayName": "编排、时间预算与模型搜索",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "任务目录化编排：每个任务一个「时间戳-标题」目录（工作区根，按路径寻址）、worker 随会话收敛为 ended、临时 worktree 只回收声明文件；继续即 cycle+1 重走流程且不重做已完成任务。需要 Python 3 标准库 sqlite3。",
   "author": {
     "name": "qihoo"

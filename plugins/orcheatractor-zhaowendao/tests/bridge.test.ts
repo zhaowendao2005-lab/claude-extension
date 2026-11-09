@@ -143,3 +143,12 @@ test('dispatch preflights the batch before spawning anything', async () => {
   const missing = await h.budget({ action: 'dispatch', workers: [{ label: 'a', model: 'sonnet', card_path: `${dir}/cards/nope.md`, files: ['/ws/out/a.json'] }] })
   expect(missing.isError).toBe(true); expect(spawned).toBe(0)
 })
+
+test('slash command never submits a prompt while holding its own turn', async () => {
+  const h = harness(); await h.emit('session.start', { cwd: '/ws' })
+  const result = await h.emit('command.run', { command: 'orcheatractor-zhaowendao', args: '5m 修登录' })
+  // 宿主禁止 command.run 里 prompt.submit（会等自己占着的这一轮）：必须零调用
+  expect(h.submitted()).toBe(0)
+  expect(result.context.join('\n')).toContain('修登录')
+  expect(h.run().status).toBe('running')
+})

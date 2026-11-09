@@ -522,8 +522,10 @@ export const register: Register = (on, options) => {
       if (cmd.action === 'error') return {text:cmd.message}
       const a = cmd.action === 'stop' ? {action:'cancel'} : cmd.action === 'extend' ? {action:'extend',minutes:String(cmd.ms / 60000)} : cmd
       const text = await runAction($, a)
-      if (cmd.action === 'start' && cmd.task) await $.prompt.submit({text:cmd.task})
-      return {text,context:[text]}
+      // 不能在 command.run 里 prompt.submit（会等自己占着的这一轮）。任务通过
+      // context 交给主 agent，同一条命令结果里就能读到并开始执行。
+      const task = cmd.action === 'start' && cmd.task ? String(cmd.task) : ''
+      return { text, context: task ? [text, `用户交给你的任务：${task}`] : [text] }
     } catch (e) { return {text:`编排操作失败：${String(e).slice(0,500)}`} }
   })
   on('tool.call', {tool:'mcp__orcheatractor-zhaowendao__budget'}, async ($, e: any) => {
